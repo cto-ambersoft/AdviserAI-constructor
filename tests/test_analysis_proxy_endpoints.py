@@ -47,7 +47,24 @@ async def test_get_analysis_runs_forward_query(monkeypatch: pytest.MonkeyPatch) 
 
         assert date == "2026-02-20"
         assert limit == "1"
-        return JSONResponse(content={"total": 1, "runs": [{"_id": "r1"}]}, status_code=200)
+        return JSONResponse(
+            content={
+                "total": 2,
+                "runs": [
+                    {"_id": "r1"},
+                    {
+                        "_id": "r2",
+                        "indicatorRecommendations": {
+                            "recommendedFromAvailable": ["VWAP", "EMA Fast (21)"],
+                            "additionalSuggested": ["OBV"],
+                            "rationale": "range market",
+                            "bull": {"probabilityPct": 55, "takeProfit": 69357, "stopLoss": 64900},
+                        },
+                    },
+                ],
+            },
+            status_code=200,
+        )
 
     monkeypatch.setattr(analysis.analysis_proxy_service, "get_runs", _fake_get_runs)
     transport = ASGITransport(app=app)
@@ -57,6 +74,7 @@ async def test_get_analysis_runs_forward_query(monkeypatch: pytest.MonkeyPatch) 
         )
     assert response.status_code == 200
     assert response.json()["runs"][0]["_id"] == "r1"
+    assert response.json()["runs"][1]["indicatorRecommendations"]["additionalSuggested"] == ["OBV"]
 
 
 async def test_market_state_route_preferred_over_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,3 +130,10 @@ async def test_analysis_proxy_error_is_returned(monkeypatch: pytest.MonkeyPatch)
         response = await client.get("/api/v1/analysis/market-state")
     assert response.status_code == 502
     assert response.json()["detail"] == "downstream unavailable"
+
+
+async def test_analysis_runs_normalizer_handles_invalid_indicator_recommendations() -> None:
+    normalized = analysis.analysis_proxy_service._normalize_runs_payload(
+        {"runs": [{"_id": "r1", "indicatorRecommendations": "legacy-string"}]}
+    )
+    assert normalized["runs"][0]["indicatorRecommendations"] is None

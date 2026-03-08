@@ -3,7 +3,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.services.backtesting.common import PositionSizer, calculate_performance_metrics
+from app.services.backtesting.common import (
+    PositionSizer,
+    add_capital_metrics,
+    annotate_trade_confirmations,
+    calculate_performance_metrics,
+)
 from app.services.backtesting.stop_logic import compute_stop_loss
 
 VWAP_PRESETS = {
@@ -298,6 +303,7 @@ def run_vwap_backtest(
     indicators: dict[str, pd.Series],
     params: dict[str, Any],
 ) -> dict[str, Any]:
+    account_balance = float(params.get("account_balance", 1000.0))
     enabled = resolve_enabled_indicators(params)
     trades = simulate_trades(
         df=df,
@@ -309,7 +315,7 @@ def run_vwap_backtest(
         cooldown_bars=int(params.get("cooldown_bars", 5)),
         risk_per_trade=float(params.get("risk_per_trade", 1.0)),
         max_positions=int(params.get("max_positions", 5)),
-        account_balance=float(params.get("account_balance", 1000.0)),
+        account_balance=account_balance,
         max_position_pct=float(params.get("max_position_pct", 100.0)),
         stop_mode=str(params.get("stop_mode", "ATR")),
         swing_lookback=int(params.get("swing_lookback", 20)),
@@ -318,14 +324,21 @@ def run_vwap_backtest(
         ob_buffer_atr=float(params.get("ob_buffer_atr", 0.15)),
         ob_lookback=int(params.get("ob_lookback", 120)),
     )
+    trades = annotate_trade_confirmations(trades)
+    summary, equity_curve = add_capital_metrics(
+        summary=calculate_performance_metrics(trades),
+        trades=trades,
+        initial_balance=account_balance,
+    )
     chart_points = {
         "ohlcv": df.reset_index().to_dict(orient="records"),
         "ema_fast": indicators["ema_fast"].tolist(),
         "ema_slow": indicators["ema_slow"].tolist(),
         "vwap": indicators["vwap"].tolist(),
+        "equity_curve": equity_curve,
     }
     return {
-        "summary": calculate_performance_metrics(trades),
+        "summary": summary,
         "trades": trades,
         "chart_points": chart_points,
         "explanations": [

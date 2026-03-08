@@ -5,12 +5,15 @@ from pydantic import BaseModel, ConfigDict, Field
 AUDIT_EVENTS = (
     "BUILDER_CHANGE",
     "SAVE_STRATEGY",
+    "UPDATE_STRATEGY",
+    "INDICATORS_CHANGE",
     "CLEAR_AUDIT_LOG",
     "PORTFOLIO_RUN",
 )
 AUDIT_TARGET_TYPES = ("system", "strategy", "portfolio", "backtest")
 AUDIT_DEFAULT_TARGET_TYPE = "system"
 AUDIT_DEFAULT_TARGET_ID = "n/a"
+AUDIT_GLOBAL_ACTORS = ("system", "global", "__system__")
 
 
 class AuditLogRead(BaseModel):

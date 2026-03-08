@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException, status
 from taskiq import AsyncTaskiqTask
 
+from app.api.deps import CurrentUser, DbSession
+from app.schemas.audit import AuditLogCreate
 from app.schemas.backtest import (
     ATR_ORDER_BLOCK_TIMEFRAMES,
     GRID_BOT_TIMEFRAMES,
@@ -33,10 +35,16 @@ from app.schemas.backtest import (
     VwapCatalog,
 )
 from app.services.backtesting.service import BacktestingService
+from app.services.state.audit_service import AuditService
 from app.worker.tasks import run_portfolio_backtest
 
 router = APIRouter()
 service = BacktestingService()
+audit_service = AuditService()
+
+
+def _strategy_params(model_cls: type) -> list[str]:
+    return sorted(model_cls.model_fields.keys())
 
 
 @router.get(
@@ -92,12 +100,23 @@ async def get_backtest_catalog() -> BacktestCatalogResponse:
         portfolio=PortfolioCatalog(
             timeframes=list(PORTFOLIO_TIMEFRAMES),
             builtin_strategies=list(PORTFOLIO_BUILTIN_STRATEGIES),
+            builtin_strategy_params={
+                "VWAP Builder": _strategy_params(VwapBacktestRequest),
+                "ATR Order-Block": _strategy_params(AtrOrderBlockRequest),
+                "Knife Catcher": _strategy_params(KnifeCatcherRequest),
+                "Grid BOT": _strategy_params(GridBotRequest),
+                "Intraday Momentum": _strategy_params(IntradayMomentumRequest),
+            },
         ),
     )
 
 
 @router.post("/vwap", response_model=BacktestResponse, summary="Run VWAP builder backtest")
-async def run_vwap_backtest(payload: VwapBacktestRequest) -> BacktestResponse:
+async def run_vwap_backtest(
+    payload: VwapBacktestRequest,
+    session: DbSession,
+    current_user: CurrentUser,
+) -> BacktestResponse:
     try:
         data = await service.run_vwap(payload.model_dump())
     except ValueError as exc:
@@ -108,6 +127,23 @@ async def run_vwap_backtest(payload: VwapBacktestRequest) -> BacktestResponse:
     if not payload.include_series:
         data["chart_points"] = {}
     data["trades"] = data["trades"][: payload.trades_limit]
+    await audit_service.create_event(
+        session=session,
+        actor=current_user.email,
+        payload=AuditLogCreate(
+            event="BUILDER_CHANGE",
+            reason="User ran VWAP builder backtest.",
+            target_type="backtest",
+            target_id="vwap",
+            payload={
+                "symbol": payload.symbol,
+                "timeframe": payload.timeframe,
+                "preset": payload.preset,
+                "regime": payload.regime,
+                "enabled": payload.enabled,
+            },
+        ),
+    )
     return BacktestResponse(**data)
 
 
@@ -184,11 +220,45 @@ async def run_intraday_backtest(payload: IntradayMomentumRequest) -> BacktestRes
 
 
 @router.post("/portfolio", summary="Run portfolio backtest")
-async def run_portfolio(payload: PortfolioBacktestRequest) -> dict[str, object]:
+async def run_portfolio(
+    payload: PortfolioBacktestRequest,
+    session: DbSession,
+    current_user: CurrentUser,
+) -> dict[str, object]:
+    request_payload = payload.model_dump()
+    request_payload["user_id"] = current_user.id
     if payload.async_job:
+        if payload.user_strategies and not payload.strategies:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Async portfolio jobs do not support user_strategies yet.",
+            )
         task: AsyncTaskiqTask[dict[str, object]] = await run_portfolio_backtest.kiq(
-            payload.model_dump()
+            request_payload
         )
         return {"status": "queued", "task_id": task.task_id}
-    data = await service.run_portfolio(payload.model_dump())
+    request_payload["session"] = session
+    try:
+        data = await service.run_portfolio(request_payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    await audit_service.create_event(
+        session=session,
+        actor=current_user.email,
+        payload=AuditLogCreate(
+            event="PORTFOLIO_RUN",
+            reason="User ran portfolio backtest.",
+            target_type="portfolio",
+            target_id="portfolio",
+            payload={
+                "total_capital": payload.total_capital,
+                "user_strategies_count": len(payload.user_strategies),
+                "builtin_strategies_count": len(payload.builtin_strategies),
+                "legacy_strategies_count": len(payload.strategies),
+            },
+        ),
+    )
     return BacktestResponse(**data).model_dump()

@@ -8,6 +8,40 @@ from app.services.indicators.engine import calc_indicators
 from app.services.market_data.service import MarketDataService
 
 
+def _assert_capital_metrics(result: dict[str, object]) -> None:
+    summary = result["summary"]
+    chart_points = result["chart_points"]
+    assert isinstance(summary, dict)
+    assert "initial_balance" in summary
+    assert "final_balance" in summary
+    assert "total_pnl" in summary
+    assert "avg_risk_per_trade" in summary
+    assert "client_values" in summary
+    assert "client_labels" in summary
+    assert "client_stats" in summary
+    assert isinstance(summary["client_values"], dict)
+    assert isinstance(summary["client_labels"], dict)
+    assert isinstance(summary["client_stats"], list)
+    assert "equity_curve" in chart_points
+    assert isinstance(chart_points["equity_curve"], list)
+    assert len(chart_points["equity_curve"]) >= 1
+
+
+def _assert_trade_confirmation_shape(trade: dict[str, object]) -> None:
+    assert "confirmation_status" in trade
+    assert "outcome" in trade
+    assert "is_take_profit" in trade
+    assert "is_stop_loss" in trade
+    assert "is_closed" in trade
+    assert "is_profit" in trade
+    assert "exit_reason_normalized" in trade
+    assert "entryIndex" in trade
+    assert "exitIndex" in trade
+    assert "entryTime" in trade
+    assert "exitTime" in trade
+    assert "entryPrice" in trade
+
+
 def _frame(count: int = 220):
     base = datetime(2025, 1, 1, tzinfo=UTC)
     rows: list[dict[str, float | str]] = []
@@ -48,8 +82,10 @@ def test_vwap_snapshot_summary_trades_explanations() -> None:
     result = run_vwap_backtest(df, calc_indicators(df), payload)
     assert set(result.keys()) == {"summary", "trades", "chart_points", "explanations"}
     assert isinstance(result["summary"]["total_trades"], int)
+    _assert_capital_metrics(result)
     if result["trades"]:
         assert "sl_explain" in result["trades"][0]
+        _assert_trade_confirmation_shape(result["trades"][0])
     if result["explanations"]:
         assert "sl_explain" in result["explanations"][0]
 
@@ -58,8 +94,10 @@ def test_atr_ob_snapshot_contains_pnl_usdt() -> None:
     df = _frame()
     result = run_atr_order_block(df, {"allocation_usdt": 500.0})
     assert set(result.keys()) == {"summary", "trades", "chart_points", "explanations"}
+    _assert_capital_metrics(result)
     if result["trades"]:
         assert "pnl_usdt" in result["trades"][0]
+        _assert_trade_confirmation_shape(result["trades"][0])
 
 
 def test_grid_snapshot_supports_order_size_and_eod_close() -> None:
@@ -73,8 +111,10 @@ def test_grid_snapshot_supports_order_size_and_eod_close() -> None:
         },
     )
     assert set(result.keys()) == {"summary", "trades", "chart_points", "explanations"}
+    _assert_capital_metrics(result)
     if result["trades"]:
         assert result["trades"][-1]["exit_reason"] in {"GRID_TP", "EOD_CLOSE"}
+        _assert_trade_confirmation_shape(result["trades"][0])
 
 
 def test_intraday_snapshot_supports_fixed_entry_size() -> None:
@@ -89,3 +129,6 @@ def test_intraday_snapshot_supports_fixed_entry_size() -> None:
         },
     )
     assert set(result.keys()) == {"summary", "trades", "chart_points", "explanations"}
+    _assert_capital_metrics(result)
+    if result["trades"]:
+        _assert_trade_confirmation_shape(result["trades"][0])

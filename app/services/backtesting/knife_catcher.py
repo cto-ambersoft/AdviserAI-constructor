@@ -2,6 +2,8 @@ from typing import Any
 
 import pandas as pd
 
+from app.services.backtesting.common import add_capital_metrics, annotate_trade_confirmations
+
 
 def _range_pct(open_price: float, high: float, low: float) -> float:
     return (high - low) / open_price if open_price else 0.0
@@ -182,6 +184,7 @@ def knife_catcher_backtest(
 
 
 def run_knife_catcher(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
+    account_balance = float(params.get("account_balance", 1000.0))
     trades_df = knife_catcher_backtest(
         df=df,
         side=str(params.get("side", "long")),
@@ -199,16 +202,33 @@ def run_knife_catcher(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any
         max_requotes=int(params.get("max_requotes", 6)),
     )
     if trades_df.empty:
-        summary = {"total_trades": 0, "win_rate": 0.0, "total_return_pct": 0.0}
+        summary = {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "total_return_pct": 0.0,
+            "total_pnl_usdt": 0.0,
+        }
     else:
+        trades_df = trades_df.copy()
+        trades_df["pnl_usdt"] = trades_df["pnl_pct"].astype(float) * account_balance
         summary = {
             "total_trades": int(len(trades_df)),
             "win_rate": float((trades_df["pnl_pct"] > 0).mean() * 100),
             "total_return_pct": float(trades_df["pnl_pct"].sum() * 100),
+            "total_pnl_usdt": float(trades_df["pnl_usdt"].sum()),
         }
+    trades = annotate_trade_confirmations(trades_df.to_dict(orient="records"))
+    summary, equity_curve = add_capital_metrics(
+        summary=summary,
+        trades=trades,
+        initial_balance=account_balance,
+    )
     return {
         "summary": summary,
-        "trades": trades_df.to_dict(orient="records"),
-        "chart_points": {"ohlcv": df.reset_index().to_dict(orient="records")},
+        "trades": trades,
+        "chart_points": {
+            "ohlcv": df.reset_index().to_dict(orient="records"),
+            "equity_curve": equity_curve,
+        },
         "explanations": [],
     }

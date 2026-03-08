@@ -3,6 +3,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.services.backtesting.common import add_capital_metrics, annotate_trade_confirmations
+
 
 def _calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
@@ -119,6 +121,7 @@ def atr_ob_backtest(
 
 
 def run_atr_order_block(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
+    allocation_usdt = float(params.get("allocation_usdt", 1000.0))
     trades_df, work = atr_ob_backtest(
         df=df,
         ema_period=int(params.get("ema_period", 50)),
@@ -127,10 +130,15 @@ def run_atr_order_block(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, A
         ob_buffer_atr=float(params.get("ob_buffer_atr", 0.15)),
         tp_levels=params.get("tp_levels"),
         one_trade_per_ob=bool(params.get("one_trade_per_ob", True)),
-        allocation_usdt=float(params.get("allocation_usdt", 1000.0)),
+        allocation_usdt=allocation_usdt,
     )
     if trades_df.empty:
-        summary = {"total_trades": 0, "win_rate": 0.0, "total_return_pct": 0.0}
+        summary = {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "total_return_pct": 0.0,
+            "total_pnl_usdt": 0.0,
+        }
         trades: list[dict[str, Any]] = []
     else:
         trades_df = trades_df.copy()
@@ -143,12 +151,19 @@ def run_atr_order_block(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, A
         }
         raw_trades = trades_df.to_dict(orient="records")
         trades = [{str(key): value for key, value in row.items()} for row in raw_trades]
+    trades = annotate_trade_confirmations(trades)
+    summary, equity_curve = add_capital_metrics(
+        summary=summary,
+        trades=trades,
+        initial_balance=allocation_usdt,
+    )
     return {
         "summary": summary,
         "trades": trades,
         "chart_points": {
             "ohlcv": work.reset_index().to_dict(orient="records"),
             "ema": work["EMA"].tolist(),
+            "equity_curve": equity_curve,
         },
         "explanations": [],
     }

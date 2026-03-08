@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 VWAP_ALLOWED_INDICATORS = {
     "EMA Fast (21)",
@@ -136,6 +136,7 @@ class KnifeCatcherRequest(BaseBacktestRequest):
     max_wick_share_pct: float = 65.0
     requote_each_candle: bool = True
     max_requotes: int = 6
+    account_balance: float = Field(default=1000.0, gt=0)
 
 
 class GridBotRequest(BaseBacktestRequest):
@@ -172,10 +173,46 @@ class PortfolioStrategyInput(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class PortfolioUserStrategyInput(BaseModel):
+    strategy_id: int = Field(gt=0)
+    allocation_pct: float = Field(default=0.0, ge=0.0, le=100.0)
+
+
+class PortfolioBuiltinStrategyInput(BaseModel):
+    name: str
+    allocation_pct: float = Field(default=0.0, ge=0.0, le=100.0)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def validate_builtin_name(cls, value: str) -> str:
+        if value not in PORTFOLIO_BUILTIN_STRATEGIES:
+            supported = ", ".join(PORTFOLIO_BUILTIN_STRATEGIES)
+            raise ValueError(f"Unsupported builtin strategy '{value}'. Supported: {supported}")
+        return value
+
+
 class PortfolioBacktestRequest(BaseModel):
     total_capital: float = Field(default=5000.0, gt=0)
+    user_strategies: list[PortfolioUserStrategyInput] = Field(default_factory=list)
+    builtin_strategies: list[PortfolioBuiltinStrategyInput] = Field(default_factory=list)
+    # Backward-compatible legacy payload path.
     strategies: list[PortfolioStrategyInput] = Field(default_factory=list)
     async_job: bool = False
+
+    @model_validator(mode="after")
+    def validate_allocations(self) -> "PortfolioBacktestRequest":
+        if self.strategies:
+            return self
+
+        merged_allocations = [item.allocation_pct for item in self.user_strategies] + [
+            item.allocation_pct for item in self.builtin_strategies
+        ]
+        if not merged_allocations:
+            return self
+        if sum(merged_allocations) <= 0:
+            raise ValueError("At least one selected strategy must have allocation_pct > 0.")
+        return self
 
 
 class BacktestResponse(BaseModel):
@@ -216,6 +253,7 @@ class IntradayMomentumCatalog(BaseModel):
 class PortfolioCatalog(BaseModel):
     timeframes: list[str]
     builtin_strategies: list[str]
+    builtin_strategy_params: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class BacktestCatalogResponse(BaseModel):

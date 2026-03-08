@@ -11,6 +11,7 @@ from app.api.v1.endpoints import (
     health,
     live,
     market,
+    personal_analysis,
     strategies,
     trading,
 )
@@ -29,5 +30,10 @@ protected_router.include_router(market.router, prefix="/market", tags=["market"]
 protected_router.include_router(trading.router, prefix="/trading", tags=["trading"])
 protected_router.include_router(live.router, prefix="/live", tags=["live"])
 protected_router.include_router(analysis.router, prefix="/analysis", tags=["analysis"])
+protected_router.include_router(
+    personal_analysis.router,
+    prefix="/analysis/personal",
+    tags=["analysis-personal"],
+)
 
 api_router.include_router(protected_router)

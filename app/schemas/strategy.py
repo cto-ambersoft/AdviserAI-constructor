@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 STRATEGY_TYPES = (
     "builder_vwap",
@@ -20,6 +20,21 @@ class StrategyCreate(BaseModel):
     description: str | None = None
     is_active: bool = True
     config: dict[str, object] = Field(default_factory=dict)
+
+
+class StrategyUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    strategy_type: str | None = Field(default=None, min_length=1, max_length=64)
+    version: str | None = Field(default=None, min_length=1, max_length=32)
+    description: str | None = None
+    is_active: bool | None = None
+    config: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def validate_non_empty(self) -> "StrategyUpdate":
+        if self.model_dump(exclude_none=True):
+            return self
+        raise ValueError("At least one field must be provided for update.")
 
 
 class StrategyRead(BaseModel):

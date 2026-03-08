@@ -3,6 +3,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.services.backtesting.common import add_capital_metrics, annotate_trade_confirmations
+
 
 def grid_bot_backtest(
     df: pd.DataFrame,
@@ -60,7 +62,9 @@ def grid_bot_backtest(
                         "exit": take_price,
                         "qty": qty,
                         "pnl_usdt": pnl,
-                        "pnl_pct": pnl / initial_capital_usdt if initial_capital_usdt > 0 else np.nan,
+                        "pnl_pct": pnl / initial_capital_usdt
+                        if initial_capital_usdt > 0
+                        else np.nan,
                         "exit_reason": "GRID_TP",
                     }
                 )
@@ -99,19 +103,18 @@ def grid_bot_backtest(
 
 
 def run_grid_bot(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
+    initial_capital_usdt = float(
+        params.get("initial_capital_usdt", params.get("allocation_usdt", 1000.0))
+    )
     trades_df = grid_bot_backtest(
         df=df,
         ma_period=int(params.get("ma_period", 50)),
         grid_spacing_pct=float(params.get("grid_spacing_pct", 0.5)),
         grids_down=int(params.get("grids_down", 8)),
         order_fee_pct=float(params.get("order_fee_pct", 0.06)),
-        initial_capital_usdt=float(
-            params.get("initial_capital_usdt", params.get("allocation_usdt", 1000.0))
-        ),
+        initial_capital_usdt=initial_capital_usdt,
         order_size_usdt=(
-            float(params["order_size_usdt"])
-            if params.get("order_size_usdt") is not None
-            else None
+            float(params["order_size_usdt"]) if params.get("order_size_usdt") is not None else None
         ),
         close_open_positions_on_eod=bool(params.get("close_open_positions_on_eod", True)),
     )
@@ -123,9 +126,18 @@ def run_grid_bot(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
             "win_rate": float((trades_df["pnl_usdt"] > 0).mean() * 100),
             "total_pnl_usdt": float(trades_df["pnl_usdt"].sum()),
         }
+    trades = annotate_trade_confirmations(trades_df.to_dict(orient="records"))
+    summary, equity_curve = add_capital_metrics(
+        summary=summary,
+        trades=trades,
+        initial_balance=initial_capital_usdt,
+    )
     return {
         "summary": summary,
-        "trades": trades_df.to_dict(orient="records"),
-        "chart_points": {"ohlcv": df.reset_index().to_dict(orient="records")},
+        "trades": trades,
+        "chart_points": {
+            "ohlcv": df.reset_index().to_dict(orient="records"),
+            "equity_curve": equity_curve,
+        },
         "explanations": [],
     }

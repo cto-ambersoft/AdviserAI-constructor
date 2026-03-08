@@ -1,6 +1,7 @@
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class SignalBaseRequest(BaseModel):
@@ -36,10 +37,9 @@ class AtrObSignalRequest(SignalBaseRequest):
 
 
 class SignalExecuteRequest(BaseModel):
-    mode: Literal["dry_run", "paper", "live"] = "dry_run"
+    mode: Literal["dry_run", "live"] = "dry_run"
     execute: bool = False
     account_id: int | None = Field(default=None, ge=1)
-    entry_usdt: float | None = Field(default=None, gt=0)
     fee_pct: float = Field(default=0.06, ge=0, le=1.0)
 
     @model_validator(mode="after")
@@ -70,3 +70,74 @@ class BuilderSignalRunRequest(BaseModel):
 class AtrObSignalRunRequest(BaseModel):
     signal: AtrObSignalRequest
     execution: SignalExecuteRequest = Field(default_factory=SignalExecuteRequest)
+
+
+class LivePaperProfileUpsertRequest(BaseModel):
+    strategy_id: int = Field(gt=0)
+    total_balance_usdt: float = Field(gt=0)
+    per_trade_usdt: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_position_notional(self) -> "LivePaperProfileUpsertRequest":
+        if self.per_trade_usdt > self.total_balance_usdt:
+            raise ValueError("per_trade_usdt must be less than or equal to total_balance_usdt.")
+        return self
+
+
+class LivePaperProfileRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    strategy_id: int
+    strategy_revision: int
+    is_running: bool
+    total_balance_usdt: float
+    per_trade_usdt: float
+    last_processed_at: datetime | None = None
+    last_poll_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class LivePaperTradeRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    profile_id: int
+    strategy_id: int
+    strategy_revision: int
+    side: str
+    entry_time: datetime
+    exit_time: datetime
+    entry_price: float
+    exit_price: float
+    pnl_usdt: float
+    status: str
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class LivePaperEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    profile_id: int
+    strategy_revision: int
+    event_type: str
+    event_time: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class LivePaperPlayStopResponse(BaseModel):
+    profile: LivePaperProfileRead
+
+
+class LivePaperPollResponse(BaseModel):
+    profile: LivePaperProfileRead
+    live_trades_since_start: list[LivePaperTradeRead] = Field(default_factory=list)
+    events: list[LivePaperEventRead] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)

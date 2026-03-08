@@ -2,10 +2,23 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.strategy import Strategy
-from app.schemas.strategy import StrategyCreate, StrategyRead
+from app.schemas.strategy import StrategyCreate, StrategyRead, StrategyUpdate
 
 
 class StrategyManagerService:
+    async def get_strategy(
+        self,
+        session: AsyncSession,
+        strategy_id: int,
+        user_id: int,
+    ) -> StrategyRead | None:
+        row = await session.scalar(
+            select(Strategy).where(Strategy.id == strategy_id, Strategy.user_id == user_id)
+        )
+        if row is None:
+            return None
+        return StrategyRead.model_validate(row)
+
     async def list_strategies(self, session: AsyncSession, user_id: int) -> list[StrategyRead]:
         rows = await session.scalars(
             select(Strategy).where(Strategy.user_id == user_id).order_by(Strategy.created_at.desc())
@@ -41,3 +54,22 @@ class StrategyManagerService:
         await session.delete(row)
         await session.commit()
         return True
+
+    async def update_strategy(
+        self,
+        session: AsyncSession,
+        strategy_id: int,
+        payload: StrategyUpdate,
+        user_id: int,
+    ) -> StrategyRead | None:
+        row = await session.scalar(
+            select(Strategy).where(Strategy.id == strategy_id, Strategy.user_id == user_id)
+        )
+        if row is None:
+            return None
+        updates = payload.model_dump(exclude_none=True)
+        for field, value in updates.items():
+            setattr(row, field, value)
+        await session.commit()
+        await session.refresh(row)
+        return StrategyRead.model_validate(row)

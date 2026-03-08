@@ -41,7 +41,7 @@ def _candles(count: int = 180) -> list[dict[str, float | str]]:
     return rows
 
 
-async def test_builder_live_signal_endpoint_supports_dry_run_and_paper() -> None:
+async def test_builder_live_signal_endpoint_rejects_legacy_paper_mode() -> None:
     payload = {
         "signal": {
             "symbol": "BTC/USDT",
@@ -52,7 +52,26 @@ async def test_builder_live_signal_endpoint_supports_dry_run_and_paper() -> None
             "regime": "Bull",
             "stop_mode": "ATR",
         },
-        "execution": {"mode": "paper", "execute": True, "entry_usdt": 100.0, "fee_pct": 0.06},
+        "execution": {"mode": "paper", "execute": True, "fee_pct": 0.06},
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/live/signals/builder", json=payload)
+    assert response.status_code == 422
+
+
+async def test_builder_live_signal_endpoint_supports_dry_run() -> None:
+    payload = {
+        "signal": {
+            "symbol": "BTC/USDT",
+            "timeframe": "1h",
+            "bars": 180,
+            "candles": _candles(),
+            "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+            "regime": "Bull",
+            "stop_mode": "ATR",
+        },
+        "execution": {"mode": "dry_run", "execute": False},
     }
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -60,9 +79,6 @@ async def test_builder_live_signal_endpoint_supports_dry_run_and_paper() -> None
     assert response.status_code == 200
     body = response.json()
     assert "execution" in body
-    if body["has_signal"]:
-        assert body["execution"]["mode"] == "paper"
-        assert body["execution"]["status"] == "filled"
 
 
 async def test_atr_ob_live_signal_endpoint_returns_contract_shape() -> None:

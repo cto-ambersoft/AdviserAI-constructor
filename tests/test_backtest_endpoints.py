@@ -1,13 +1,20 @@
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from collections.abc import AsyncIterator
 
 import pandas as pd
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.deps import get_current_user
 from app.api.v1.endpoints import backtest as backtest_endpoint
+from app.db.session import get_db_session
 from app.main import app
+from app.models.base import Base
+from app.models.strategy import Strategy
 from app.models.user import User
+from app.services.backtesting.service import BacktestingService
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +25,30 @@ def override_current_user() -> None:
     app.dependency_overrides[get_current_user] = _fake_current_user
     yield
     app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.fixture
+async def backtest_db(tmp_path: Path) -> async_sessionmaker[AsyncSession]:
+    db_path = tmp_path / "backtest_test.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield session_factory
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def override_db_session(backtest_db: async_sessionmaker[AsyncSession]) -> None:
+    async def _get_test_db_session() -> AsyncIterator[AsyncSession]:
+        async with backtest_db() as session:
+            yield session
+
+    app.dependency_overrides[get_db_session] = _get_test_db_session
+    yield
+    app.dependency_overrides.pop(get_db_session, None)
 
 
 def _candles(count: int = 140) -> list[dict[str, float | str]]:
@@ -118,6 +149,9 @@ async def test_backtest_catalog_endpoint_returns_client_form_metadata() -> None:
         "Grid BOT",
         "Intraday Momentum",
     ]
+    assert "builtin_strategy_params" in body["portfolio"]
+    assert "VWAP Builder" in body["portfolio"]["builtin_strategy_params"]
+    assert "enabled" in body["portfolio"]["builtin_strategy_params"]["VWAP Builder"]
 
 
 async def test_vwap_backtest_uses_backend_market_fetch_when_candles_absent(
@@ -199,6 +233,81 @@ async def test_portfolio_backtest_endpoint_returns_equity() -> None:
     body = response.json()
     assert "equity" in body["chart_points"]
     assert body["summary"]["final_equity"] == 5060.0
+    assert "client_values" in body["summary"]
+    assert body["summary"]["client_values"]["finalEquity"] == 5060.0
+
+
+async def test_portfolio_backtest_supports_user_and_builtin_split_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_resolve_portfolio_strategies(payload, session, user_id: int):
+        assert user_id == 1
+        assert payload["user_strategies"][0]["strategy_id"] == 7
+        assert payload["builtin_strategies"][0]["name"] == "Grid BOT"
+        return [
+            {
+                "name": "Saved VWAP",
+                "weight": 70.0,
+                    "config": {"strategy_type": "manual"},
+                "trades": [{"exit_time": "2025-01-01T00:00:00+00:00", "pnl_usdt": 100.0}],
+            },
+            {
+                "name": "Grid BOT",
+                "weight": 30.0,
+                    "config": {"strategy_type": "manual"},
+                "trades": [{"exit_time": "2025-01-02T00:00:00+00:00", "pnl_usdt": -50.0}],
+            },
+        ]
+
+    monkeypatch.setattr(
+        backtest_endpoint.service,
+        "_resolve_portfolio_strategies",
+        _fake_resolve_portfolio_strategies,
+    )
+    payload = {
+        "total_capital": 10_000,
+        "user_strategies": [{"strategy_id": 7, "allocation_pct": 70.0}],
+        "builtin_strategies": [{"name": "Grid BOT", "allocation_pct": 30.0, "config": {}}],
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/backtest/portfolio", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"]["final_equity"] == 10050.0
+    assert body["summary"]["allocated_capital"] == 10_000.0
+    assert len(body["trades"]) == 2
+    assert body["explanations"][0]["strategy"] == "Saved VWAP"
+
+
+async def test_portfolio_service_resolves_saved_strategies_by_user_and_id(
+    backtest_db: async_sessionmaker[AsyncSession],
+) -> None:
+    async with backtest_db() as session:
+        row = Strategy(
+            user_id=1,
+            name="My Strategy",
+            strategy_type="builder_vwap",
+            config={"symbol": "BTC/USDT", "timeframe": "1h", "bars": 140, "enabled": ["VWAP"]},
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+
+        service = BacktestingService()
+        resolved = await service._resolve_portfolio_strategies(
+            payload={
+                "user_strategies": [{"strategy_id": row.id, "allocation_pct": 60.0}],
+                "builtin_strategies": [{"name": "Grid BOT", "allocation_pct": 40.0, "config": {}}],
+            },
+            session=session,
+            user_id=1,
+        )
+    assert len(resolved) == 2
+    assert resolved[0]["name"] == "Grid BOT"
+    assert resolved[1]["name"] == "My Strategy"
+    assert resolved[1]["weight"] == 60.0
+    assert resolved[1]["config"]["strategy_type"] == "builder_vwap"
 
 
 async def test_vwap_backtest_rejects_unknown_indicators() -> None:

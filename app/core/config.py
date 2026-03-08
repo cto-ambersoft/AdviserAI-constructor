@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     debug: bool = True
     log_level: str = "INFO"
+    sql_echo: bool = False
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432
@@ -29,6 +30,14 @@ class Settings(BaseSettings):
     analysis_backend_base_url: str = "http://localhost:3001"
     analysis_backend_api_key: str = ""
     analysis_http_timeout_seconds: float = 15.0
+    taskiq_stream_maxlen: int = 10000
+    taskiq_result_keep_results: bool = False
+    taskiq_result_ex_time_seconds: int = 1800
+    taskiq_result_key_prefix: str = "taskiq:result"
+    personal_analysis_status_batch_size: int = 100
+    personal_analysis_max_attempts: int = 3
+    personal_analysis_poll_interval_seconds: int = 60
+    personal_analysis_scheduler_loop_enabled: bool = True
     cors_allow_origins: list[str] = ["*"]
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]

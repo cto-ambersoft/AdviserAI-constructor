@@ -4,7 +4,11 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 
-from app.services.backtesting.common import PositionSizer
+from app.services.backtesting.common import (
+    PositionSizer,
+    add_capital_metrics,
+    annotate_trade_confirmations,
+)
 
 
 def intraday_momentum_backtest(
@@ -123,6 +127,7 @@ def intraday_momentum_backtest(
 
 
 def run_intraday_momentum(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
+    allocation_usdt = float(params.get("allocation_usdt", 1000.0))
     trades_df = intraday_momentum_backtest(
         df=df,
         lookback=int(params.get("lookback", 20)),
@@ -133,27 +138,36 @@ def run_intraday_momentum(df: pd.DataFrame, params: dict[str, Any]) -> dict[str,
         vol_mult=float(params.get("vol_mult", 1.2)),
         time_exit_bars=int(params.get("time_exit_bars", 48)),
         side=str(params.get("side", "long")),
-        allocation_usdt=float(params.get("allocation_usdt", 1000.0)),
+        allocation_usdt=allocation_usdt,
         risk_per_trade_pct=float(params.get("risk_per_trade_pct", 1.0)),
         max_positions=int(params.get("max_positions", 1)),
         fee_pct=float(params.get("fee_pct", 0.06)),
         entry_size_usdt=(
-            float(params["entry_size_usdt"])
-            if params.get("entry_size_usdt") is not None
-            else None
+            float(params["entry_size_usdt"]) if params.get("entry_size_usdt") is not None else None
         ),
     )
     if trades_df.empty:
         summary = {"total_trades": 0, "win_rate": 0.0, "total_pnl_usdt": 0.0}
     else:
+        trades_df = trades_df.copy()
+        trades_df["risk_usdt"] = (trades_df["entry"] - trades_df["sl"]).abs() * trades_df["qty"]
         summary = {
             "total_trades": int(len(trades_df)),
             "win_rate": float((trades_df["pnl_usdt"] > 0).mean() * 100),
             "total_pnl_usdt": float(trades_df["pnl_usdt"].sum()),
         }
+    trades = annotate_trade_confirmations(trades_df.to_dict(orient="records"))
+    summary, equity_curve = add_capital_metrics(
+        summary=summary,
+        trades=trades,
+        initial_balance=allocation_usdt,
+    )
     return {
         "summary": summary,
-        "trades": trades_df.to_dict(orient="records"),
-        "chart_points": {"ohlcv": df.reset_index().to_dict(orient="records")},
+        "trades": trades,
+        "chart_points": {
+            "ohlcv": df.reset_index().to_dict(orient="records"),
+            "equity_curve": equity_curve,
+        },
         "explanations": [],
     }

@@ -5,39 +5,22 @@ from app.schemas.exchange_trading import SpotOrderCreate
 from app.schemas.live import (
     AtrObSignalRunRequest,
     BuilderSignalRunRequest,
+    LivePaperPlayStopResponse,
+    LivePaperPollResponse,
+    LivePaperProfileRead,
+    LivePaperProfileUpsertRequest,
     LiveSignalResult,
     SignalExecuteRequest,
 )
 from app.services.execution.errors import ExchangeServiceError, error_http_status
+from app.services.live_paper import LivePaperService
 from app.services.execution.trading_service import TradingService
 from app.services.live_signals import LiveSignalService
 
 router = APIRouter()
 signal_service = LiveSignalService()
 trading_service = TradingService()
-
-
-def _paper_execution(
-    *,
-    side: str,
-    symbol: str,
-    entry_price: float,
-    entry_usdt: float,
-    fee_pct: float,
-) -> dict[str, float | str]:
-    qty = entry_usdt / entry_price if entry_price > 0 else 0.0
-    notional = qty * entry_price
-    fee = notional * (fee_pct / 100.0)
-    return {
-        "mode": "paper",
-        "status": "filled",
-        "symbol": symbol,
-        "side": side,
-        "qty": qty,
-        "price": entry_price,
-        "notional": notional,
-        "fee_usdt": fee,
-    }
+live_paper_service = LivePaperService()
 
 
 async def _maybe_execute_signal(
@@ -61,17 +44,8 @@ async def _maybe_execute_signal(
         position_value = float(sizing.get("position_value", 0.0) or 0.0)
     else:
         position_value = 0.0
-    entry_usdt = float(execution.entry_usdt or position_value)
-    if entry_usdt <= 0:
-        return {"mode": execution.mode, "status": "skipped", "reason": "invalid_entry_usdt"}
-    if execution.mode == "paper":
-        return _paper_execution(
-            side=side,
-            symbol=signal_symbol,
-            entry_price=entry,
-            entry_usdt=entry_usdt,
-            fee_pct=float(execution.fee_pct),
-        )
+    if position_value <= 0:
+        return {"mode": execution.mode, "status": "skipped", "reason": "invalid_position_value"}
     if execution.mode == "live":
         if execution.account_id is None:
             raise HTTPException(status_code=422, detail="account_id is required for live execution")
@@ -80,7 +54,7 @@ async def _maybe_execute_signal(
             symbol=signal_symbol,
             side="buy" if side == "LONG" else "sell",
             order_type="market",
-            amount=entry_usdt / entry,
+            amount=position_value / entry,
         )
         order = await trading_service.place_spot_order(
             session=session,
@@ -139,3 +113,97 @@ async def run_atr_ob_signal(
         raise HTTPException(status_code=error_http_status(exc.code), detail=exc.message) from exc
     signal["execution"] = execution
     return LiveSignalResult(**signal)
+
+
+@router.put(
+    "/paper/profile",
+    response_model=LivePaperProfileRead,
+    summary="Create or update live paper profile",
+)
+async def upsert_live_paper_profile(
+    payload: LivePaperProfileUpsertRequest,
+    session: DbSession,
+    current_user: CurrentUser,
+) -> LivePaperProfileRead:
+    try:
+        profile = await live_paper_service.upsert_profile(
+            session=session,
+            user_id=current_user.id,
+            payload=payload,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return LivePaperProfileRead.model_validate(profile)
+
+
+@router.post(
+    "/paper/play",
+    response_model=LivePaperPlayStopResponse,
+    summary="Enable live paper mode",
+)
+async def play_live_paper(session: DbSession, current_user: CurrentUser) -> LivePaperPlayStopResponse:
+    try:
+        profile = await live_paper_service.set_running(
+            session=session,
+            user_id=current_user.id,
+            is_running=True,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return LivePaperPlayStopResponse(profile=LivePaperProfileRead.model_validate(profile))
+
+
+@router.post(
+    "/paper/stop",
+    response_model=LivePaperPlayStopResponse,
+    summary="Disable live paper mode",
+)
+async def stop_live_paper(session: DbSession, current_user: CurrentUser) -> LivePaperPlayStopResponse:
+    try:
+        profile = await live_paper_service.set_running(
+            session=session,
+            user_id=current_user.id,
+            is_running=False,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return LivePaperPlayStopResponse(profile=LivePaperProfileRead.model_validate(profile))
+
+
+@router.get(
+    "/paper/poll",
+    response_model=LivePaperPollResponse,
+    summary="Poll latest live paper trades and events",
+)
+async def poll_live_paper(
+    session: DbSession,
+    current_user: CurrentUser,
+    last_trade_id: int | None = None,
+    last_event_id: int | None = None,
+    limit: int = 500,
+) -> LivePaperPollResponse:
+    try:
+        (
+            profile,
+            live_trades_since_start,
+            events,
+            metrics,
+        ) = await live_paper_service.poll_profile(
+            session=session,
+            user_id=current_user.id,
+            last_trade_id=last_trade_id,
+            last_event_id=last_event_id,
+            limit=limit,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return LivePaperPollResponse(
+        profile=LivePaperProfileRead.model_validate(profile),
+        live_trades_since_start=[trade for trade in live_trades_since_start],
+        events=[event for event in events],
+        metrics=metrics,
+    )
