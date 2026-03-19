@@ -1,6 +1,11 @@
+from datetime import datetime
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.exchange_trading import (
+    NormalizedFuturesPosition,
+    NormalizedTrade,
+    OrderSide,
     SpotBalancesRead,
     SpotOrderCreate,
     SpotOrderRead,
@@ -249,4 +254,144 @@ class TradingService:
             unrealized_pnl_quote=unrealized,
             total_fees_quote=fees,
             assets=assets,
+        )
+
+    async def set_futures_leverage(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        leverage: int,
+    ) -> None:
+        await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        await adapter.set_futures_leverage(symbol=symbol, leverage=leverage)
+
+    async def place_futures_market_order(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        reduce_only: bool,
+        client_order_id: str | None = None,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+    ) -> SpotOrderRead:
+        account = await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        order = await adapter.place_futures_market_order(
+            symbol=symbol,
+            side=side,
+            amount=amount,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+        )
+        return SpotOrderRead(
+            account_id=account_id,
+            exchange_name=account.exchange_name,
+            mode=account.mode,
+            order=order,
+        )
+
+    async def close_futures_market_reduce_only(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        client_order_id: str | None = None,
+    ) -> SpotOrderRead:
+        return await self.place_futures_market_order(
+            session=session,
+            user_id=user_id,
+            account_id=account_id,
+            symbol=symbol,
+            side=side,
+            amount=amount,
+            reduce_only=True,
+            client_order_id=client_order_id,
+            take_profit_price=None,
+            stop_loss_price=None,
+        )
+
+    async def fetch_futures_position(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+    ) -> NormalizedFuturesPosition | None:
+        await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        return await adapter.fetch_futures_position(symbol=symbol)
+
+    async def fetch_futures_trades(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[NormalizedTrade]:
+        await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        return await adapter.fetch_futures_trades(symbol=symbol, since=since, limit=limit)
+
+    async def fetch_futures_trades_page(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[NormalizedTrade], str | None]:
+        await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        return await adapter.fetch_futures_trades_page(
+            symbol=symbol,
+            since=since,
+            limit=limit,
+            cursor=cursor,
         )

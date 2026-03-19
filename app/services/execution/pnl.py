@@ -22,6 +22,27 @@ def _split_symbol(symbol: str) -> tuple[str, str] | None:
     return base, quote_clean
 
 
+def _fee_to_quote(
+    *,
+    trade: NormalizedTrade,
+    base_asset: str,
+    quote_asset: str,
+    mark_prices: dict[str, float],
+) -> float:
+    if trade.fee_cost <= 0 or not trade.fee_currency:
+        return 0.0
+    fee_asset = trade.fee_currency.upper()
+    if fee_asset == quote_asset:
+        return float(trade.fee_cost)
+    if fee_asset == base_asset:
+        price = float(trade.price)
+        return float(trade.fee_cost) * price if price > 0 else 0.0
+    fee_mark = mark_prices.get(fee_asset)
+    if fee_mark is None or fee_mark <= 0:
+        return 0.0
+    return float(trade.fee_cost) * float(fee_mark)
+
+
 def calculate_spot_pnl(
     *,
     trades: list[NormalizedTrade],
@@ -51,9 +72,12 @@ def calculate_spot_pnl(
             continue
 
         lots = lots_by_asset.setdefault(base_asset, [])
-        fee_quote = 0.0
-        if trade.fee_currency and trade.fee_currency.upper() == quote:
-            fee_quote = max(0.0, trade.fee_cost)
+        fee_quote = _fee_to_quote(
+            trade=trade,
+            base_asset=base_asset,
+            quote_asset=quote,
+            mark_prices=mark_prices,
+        )
         fees_by_asset[base_asset] = fees_by_asset.get(base_asset, 0.0) + fee_quote
 
         if trade.side == "buy":

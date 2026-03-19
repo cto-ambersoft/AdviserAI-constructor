@@ -1,12 +1,14 @@
 import logging
 
 from app.db.session import AsyncSessionFactory
+from app.services.auto_trade.service import AutoTradeService
 from app.services.backtesting.service import BacktestingService
 from app.services.personal_analysis.service import PersonalAnalysisService
 from app.worker.broker import broker
 
 service = BacktestingService()
 personal_analysis_service = PersonalAnalysisService()
+auto_trade_service = AutoTradeService()
 logger = logging.getLogger(__name__)
 
 
@@ -64,3 +66,30 @@ async def poll_personal_analysis_jobs() -> dict[str, int]:
             stats.get("errors", 0),
         )
     return stats
+
+
+@broker.task(
+    task_name="app.worker.tasks.process_auto_trade_signal_queue",
+    schedule=[{"cron": "* * * * *", "schedule_id": "auto_trade_process_every_minute"}],
+)
+async def process_auto_trade_signal_queue() -> dict[str, int]:
+    async with AsyncSessionFactory() as session:
+        stats = await auto_trade_service.process_signal_queue(session=session)
+    if _stats_has_non_zero(
+        stats,
+        keys=("polled", "completed", "skipped", "retried", "dead", "errors"),
+    ):
+        logger.info(
+            (
+                "auto_trade_process summary: polled=%s completed=%s skipped=%s "
+                "retried=%s dead=%s errors=%s"
+            ),
+            stats.get("polled", 0),
+            stats.get("completed", 0),
+            stats.get("skipped", 0),
+            stats.get("retried", 0),
+            stats.get("dead", 0),
+            stats.get("errors", 0),
+        )
+    return stats
+

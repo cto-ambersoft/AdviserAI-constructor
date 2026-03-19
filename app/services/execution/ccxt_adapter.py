@@ -1,15 +1,19 @@
 import asyncio
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, SupportsFloat, cast
+from typing import Any, Literal, SupportsFloat, cast
 
 import ccxt.async_support as ccxt
 
 from app.core.config import get_settings
 from app.schemas.exchange_trading import (
     AttachedTriggerOrder,
+    FuturesPositionSide,
     NormalizedBalance,
+    NormalizedFuturesPosition,
     NormalizedOrder,
     NormalizedTrade,
     OrderSide,
@@ -19,6 +23,14 @@ from app.schemas.exchange_trading import (
 )
 from app.services.execution.base import ExchangeCredentials
 from app.services.execution.errors import ExchangeServiceError
+
+
+@dataclass(frozen=True, slots=True)
+class _FuturesProfile:
+    exchange_id: str
+    default_type: str
+    params: dict[str, object]
+    force_isolated_margin: bool = False
 
 
 class CcxtAdapter:
@@ -284,21 +296,26 @@ class CcxtAdapter:
         except ExchangeServiceError as exc:
             if not client_order_id:
                 raise
-            if not self._looks_like_duplicate_id_error(exc.message):
-                raise
-            existing = await self._find_order_by_client_order_id(
-                exchange=exchange,
-                symbol=symbol,
-                client_order_id=client_order_id,
-            )
-            if existing is None:
-                raise
-            return existing
+            should_try_recover = self._looks_like_duplicate_id_error(exc.message) or exc.retryable
+            if should_try_recover:
+                existing = await self._find_order_by_client_order_id(
+                    exchange=exchange,
+                    symbol=symbol,
+                    client_order_id=client_order_id,
+                )
+                if existing is not None:
+                    return existing
+            raise
 
     @staticmethod
     def _looks_like_duplicate_id_error(message: str) -> bool:
         lowered = message.lower()
-        return "duplicate" in lowered or "orderlinkid" in lowered or "clientorderid" in lowered
+        return (
+            "duplicate" in lowered
+            or "orderlinkid" in lowered
+            or "clientorderid" in lowered
+            or "client order id" in lowered
+        )
 
     async def _find_order_by_client_order_id(
         self,
@@ -319,9 +336,11 @@ class CcxtAdapter:
                 if not isinstance(candidate, str):
                     info = row.get("info")
                     if isinstance(info, dict):
-                        raw_candidate = info.get("orderLinkId")
-                        if isinstance(raw_candidate, str):
-                            candidate = raw_candidate
+                        for key in ("orderLinkId", "clientOrderId", "origClientOrderId"):
+                            raw_candidate = info.get(key)
+                            if isinstance(raw_candidate, str) and raw_candidate:
+                                candidate = raw_candidate
+                                break
                 if candidate == client_order_id:
                     return row
         return None
@@ -594,6 +613,68 @@ class CcxtAdapter:
             raw = await self._call_with_retry(exchange.fetch_my_trades, symbol, None, limit)
         return [self._normalize_trade(item) for item in raw]
 
+    async def fetch_futures_trades(
+        self,
+        *,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[NormalizedTrade]:
+        trades, _ = await self.fetch_futures_trades_page(
+            symbol=symbol,
+            since=since,
+            limit=limit,
+            cursor=None,
+        )
+        return trades
+
+    async def fetch_futures_trades_page(
+        self,
+        *,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[NormalizedTrade], str | None]:
+        profile = self._ensure_futures_supported()
+        since_ms = int(since.timestamp() * 1000) if since is not None else None
+        params: dict[str, object] = dict(profile.params)
+        if cursor:
+            if self._credentials.exchange_name == "binance":
+                # Binance rejects startTime when paginating by fromId.
+                since_ms = None
+                params["fromId"] = cursor
+            elif self._credentials.exchange_name == "bybit":
+                # Keep cursor in params for exchanges that support it.
+                params["cursor"] = cursor
+        async with self._client(
+            default_type=profile.default_type,
+            exchange_id=profile.exchange_id,
+        ) as exchange:
+            raw = await self._call_with_retry(
+                exchange.fetch_my_trades,
+                symbol,
+                since_ms,
+                limit,
+                params,
+            )
+        normalized = [self._normalize_trade(item) for item in raw]
+        next_cursor = self._next_futures_trades_cursor(trades=normalized, previous_cursor=cursor)
+        return normalized, next_cursor
+
+    @staticmethod
+    def _next_futures_trades_cursor(
+        *, trades: list[NormalizedTrade], previous_cursor: str | None
+    ) -> str | None:
+        if not trades:
+            return None
+        last_trade_id = trades[-1].id
+        if not last_trade_id:
+            return None
+        if previous_cursor is not None and last_trade_id == previous_cursor:
+            return None
+        return last_trade_id
+
     async def fetch_spot_positions_view(
         self,
         *,
@@ -637,14 +718,536 @@ class CcxtAdapter:
                 )
         return rows
 
+    def _futures_profile(self) -> _FuturesProfile:
+        exchange_name = self._credentials.exchange_name
+        if exchange_name == "bybit":
+            return _FuturesProfile(
+                exchange_id="bybit",
+                default_type="linear",
+                params={"category": "linear"},
+                force_isolated_margin=True,
+            )
+        if exchange_name == "binance":
+            return _FuturesProfile(
+                exchange_id="binanceusdm",
+                default_type="swap",
+                params={},
+            )
+        raise ExchangeServiceError(
+            code="unsupported_exchange",
+            message="Auto-trade futures v1 supports Bybit and Binance USDT-M only.",
+        )
+
+    def _ensure_futures_supported(self) -> _FuturesProfile:
+        if self._credentials.exchange_name not in {"bybit", "binance"}:
+            raise ExchangeServiceError(
+                code="unsupported_exchange",
+                message="Auto-trade futures v1 supports Bybit and Binance USDT-M only.",
+            )
+        return self._futures_profile()
+
+    @staticmethod
+    def _normalize_margin_mode(value: object) -> Literal["cross", "isolated"] | None:
+        if value is None:
+            return None
+        raw = str(value).strip().lower()
+        if raw in {"cross", "crossed"}:
+            return "cross"
+        if raw in {"isolated", "isolate", "isol"}:
+            return "isolated"
+        if raw in {"0"}:
+            return "cross"
+        if raw in {"1"}:
+            return "isolated"
+        return None
+
+    @classmethod
+    def _extract_margin_mode(
+        cls, row: dict[str, Any], info: dict[str, Any] | None
+    ) -> Literal["cross", "isolated"] | None:
+        direct = cls._normalize_margin_mode(row.get("marginMode"))
+        if direct is not None:
+            return direct
+        if info is None:
+            return None
+        for key in ("tradeMode", "marginMode"):
+            parsed = cls._normalize_margin_mode(info.get(key))
+            if parsed is not None:
+                return parsed
+        isolated = info.get("isolated")
+        if isinstance(isolated, bool):
+            return "isolated" if isolated else "cross"
+        return None
+
+    def _is_non_critical_bybit_margin_mode_error(self, exc: ExchangeServiceError) -> bool:
+        if exc.code not in {"exchange_error", "unexpected_error"}:
+            return False
+        message = exc.message.lower()
+        ret_code = self._extract_ret_code(exc.message)
+        # Bybit may return "no state change" when already in isolated mode.
+        if ret_code == 110026:
+            return True
+        if "margin mode" in message and ("not modified" in message or "same" in message):
+            return True
+        if "state change" in message:
+            return True
+        return False
+
+    @staticmethod
+    def _extract_binance_error_code(message: str) -> int | None:
+        match = re.search(r"['\"]code['\"]\s*:\s*(-?\d+)", message)
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _is_non_critical_binance_margin_mode_error(self, exc: ExchangeServiceError) -> bool:
+        if exc.code not in {"exchange_error", "unexpected_error"}:
+            return False
+        message = exc.message.lower()
+        code = self._extract_binance_error_code(exc.message)
+        if code == -4046:
+            return True
+        if "no need to change margin type" in message:
+            return True
+        return False
+
+    async def _ensure_binance_isolated_margin(
+        self,
+        *,
+        exchange: Any,
+        symbol: str,
+    ) -> None:
+        if not hasattr(exchange, "set_margin_mode"):
+            return
+        try:
+            await self._call_with_retry(exchange.set_margin_mode, "isolated", symbol, {})
+        except ExchangeServiceError as exc:
+            if self._is_non_critical_binance_margin_mode_error(exc):
+                return
+            raise
+
+    @staticmethod
+    def _is_leverage_not_modified(exc: ExchangeServiceError) -> bool:
+        if exc.code not in {"exchange_error", "unexpected_error"}:
+            return False
+        message = exc.message.lower()
+        ret_code = CcxtAdapter._extract_ret_code(exc.message)
+        if ret_code == 110043:
+            return True
+        if "leverage" in message and "not modified" in message:
+            return True
+        if "no need to change leverage" in message:
+            return True
+        return False
+
+    async def _ensure_bybit_isolated_margin(
+        self,
+        *,
+        exchange: Any,
+        symbol: str,
+        leverage: int | None = None,
+    ) -> None:
+        params: dict[str, object] = {"category": "linear"}
+        if leverage is not None:
+            params["leverage"] = str(leverage)
+        try:
+            await self._call_with_retry(exchange.set_margin_mode, "isolated", symbol, params)
+        except ExchangeServiceError as exc:
+            if self._is_non_critical_bybit_margin_mode_error(exc):
+                return
+            raise
+
+    async def set_futures_leverage(self, *, symbol: str, leverage: int) -> None:
+        profile = self._ensure_futures_supported()
+        try:
+            async with self._client(
+                default_type=profile.default_type,
+                exchange_id=profile.exchange_id,
+            ) as exchange:
+                if profile.force_isolated_margin:
+                    await self._ensure_bybit_isolated_margin(
+                        exchange=exchange,
+                        symbol=symbol,
+                        leverage=leverage,
+                    )
+                if self._credentials.exchange_name == "binance":
+                    await self._ensure_binance_isolated_margin(
+                        exchange=exchange,
+                        symbol=symbol,
+                    )
+                await self._call_with_retry(
+                    exchange.set_leverage,
+                    leverage,
+                    symbol,
+                    dict(profile.params),
+                )
+        except ExchangeServiceError as exc:
+            if self._is_leverage_not_modified(exc):
+                return
+            raise
+
+    @staticmethod
+    def _extract_ret_code(message: str) -> int | None:
+        # Bybit error payloads are often embedded into exception text.
+        match = re.search(r"['\"]retCode['\"]\s*:\s*(-?\d+)", message)
+        if match is None:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    async def place_futures_market_order(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+    ) -> NormalizedOrder:
+        profile = self._ensure_futures_supported()
+        params: dict[str, object] = {**profile.params, "reduceOnly": bool(reduce_only)}
+        if client_order_id:
+            params["clientOrderId"] = client_order_id
+            if self._credentials.exchange_name == "bybit":
+                params["orderLinkId"] = client_order_id
+            if self._credentials.exchange_name == "binance":
+                params["newClientOrderId"] = client_order_id
+        if self._credentials.exchange_name != "binance":
+            if take_profit_price is not None:
+                params["takeProfit"] = float(take_profit_price)
+            if stop_loss_price is not None:
+                params["stopLoss"] = float(stop_loss_price)
+        if self._credentials.exchange_name == "bybit" and (
+            take_profit_price is not None or stop_loss_price is not None
+        ):
+            # Explicit TP/SL mode makes Bybit behavior deterministic for attached triggers.
+            params["tpslMode"] = "Full"
+            params["tpTriggerBy"] = "MarkPrice"
+            params["slTriggerBy"] = "MarkPrice"
+
+        async with self._client(
+            default_type=profile.default_type,
+            exchange_id=profile.exchange_id,
+        ) as exchange:
+            if profile.force_isolated_margin:
+                await self._ensure_bybit_isolated_margin(
+                    exchange=exchange,
+                    symbol=symbol,
+                    leverage=None,
+                )
+            if self._credentials.exchange_name == "binance" and not reduce_only:
+                await self._ensure_binance_isolated_margin(
+                    exchange=exchange,
+                    symbol=symbol,
+                )
+            if (
+                self._credentials.exchange_name == "binance"
+                and not reduce_only
+                and (take_profit_price is not None or stop_loss_price is not None)
+            ):
+                return await self._place_binance_futures_market_with_brackets(
+                    exchange=exchange,
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    client_order_id=client_order_id,
+                    params=params,
+                    take_profit_price=take_profit_price,
+                    stop_loss_price=stop_loss_price,
+                )
+            raw = await self._create_order_with_idempotency(
+                exchange=exchange,
+                symbol=symbol,
+                order_type="market",
+                side=side,
+                amount=amount,
+                price=None,
+                params=params,
+                client_order_id=client_order_id,
+            )
+            return self._normalize_order(
+                raw,
+                fallback_symbol=symbol,
+                fallback_side=side,
+                fallback_order_type="market",
+                fallback_amount=amount,
+                fallback_price=None,
+            )
+
+    async def _place_binance_futures_market_with_brackets(
+        self,
+        *,
+        exchange: Any,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        client_order_id: str | None,
+        params: dict[str, object],
+        take_profit_price: float | None,
+        stop_loss_price: float | None,
+    ) -> NormalizedOrder:
+        entry_raw = await self._create_order_with_idempotency(
+            exchange=exchange,
+            symbol=symbol,
+            order_type="market",
+            side=side,
+            amount=amount,
+            price=None,
+            params=params,
+            client_order_id=client_order_id,
+        )
+        hydrated_entry = await self._hydrate_created_order(
+            exchange=exchange,
+            symbol=symbol,
+            created_order=entry_raw,
+            client_order_id=client_order_id,
+            expected_side=side,
+            expected_order_type="market",
+            expected_amount=amount,
+            expected_price=None,
+        )
+        entry = self._normalize_order(
+            hydrated_entry,
+            fallback_symbol=symbol,
+            fallback_side=side,
+            fallback_order_type="market",
+            fallback_amount=amount,
+            fallback_price=None,
+        )
+        resolved_amount = await self._resolve_filled_amount_fast(
+            exchange=exchange,
+            symbol=symbol,
+            entry=entry,
+        )
+        if resolved_amount <= 0:
+            resolved_amount = amount if amount > 0 else 0.0
+        if resolved_amount <= 0:
+            raise ExchangeServiceError(
+                code="exchange_error",
+                message="Could not resolve executed quantity for Binance futures entry.",
+            )
+
+        close_side: OrderSide = "sell" if side == "buy" else "buy"
+        base_client_id = client_order_id or entry.client_order_id or entry.id
+        brackets: dict[str, dict[str, Any]] = {}
+
+        if stop_loss_price is not None:
+            sl_client_id = self._child_client_order_id(base_client_id, "sl")
+            sl_raw = await self._create_order_with_idempotency(
+                exchange=exchange,
+                symbol=symbol,
+                order_type="STOP_MARKET",
+                side=close_side,
+                amount=resolved_amount,
+                price=None,
+                params=self._build_binance_futures_trigger_params(
+                    trigger_price=float(stop_loss_price),
+                    client_order_id=sl_client_id,
+                ),
+                client_order_id=sl_client_id,
+            )
+            brackets["stop_loss"] = sl_raw
+
+        if take_profit_price is not None:
+            tp_client_id = self._child_client_order_id(base_client_id, "tp")
+            tp_raw = await self._create_order_with_idempotency(
+                exchange=exchange,
+                symbol=symbol,
+                order_type="TAKE_PROFIT_MARKET",
+                side=close_side,
+                amount=resolved_amount,
+                price=None,
+                params=self._build_binance_futures_trigger_params(
+                    trigger_price=float(take_profit_price),
+                    client_order_id=tp_client_id,
+                ),
+                client_order_id=tp_client_id,
+            )
+            brackets["take_profit"] = tp_raw
+
+        if brackets:
+            entry.raw["brackets"] = brackets
+        return entry
+
+    @staticmethod
+    def _build_binance_futures_trigger_params(
+        *,
+        trigger_price: float,
+        client_order_id: str | None,
+    ) -> dict[str, object]:
+        params: dict[str, object] = {
+            "reduceOnly": True,
+            "stopPrice": trigger_price,
+            "workingType": "MARK_PRICE",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
+            params["clientOrderId"] = client_order_id
+        return params
+
+    async def close_futures_market_reduce_only(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        client_order_id: str | None = None,
+    ) -> NormalizedOrder:
+        return await self.place_futures_market_order(
+            symbol=symbol,
+            side=side,
+            amount=amount,
+            reduce_only=True,
+            client_order_id=client_order_id,
+            take_profit_price=None,
+            stop_loss_price=None,
+        )
+
+    @staticmethod
+    def _normalize_futures_side(raw: object) -> str:
+        side = str(raw or "").strip().lower()
+        if side in {"long", "short"}:
+            return side
+        if side in {"buy"}:
+            return "long"
+        if side in {"sell"}:
+            return "short"
+        return "flat"
+
+    async def fetch_futures_position(
+        self,
+        *,
+        symbol: str,
+    ) -> NormalizedFuturesPosition | None:
+        profile = self._ensure_futures_supported()
+        async with self._client(
+            default_type=profile.default_type,
+            exchange_id=profile.exchange_id,
+        ) as exchange:
+            rows = await self._call_with_retry(
+                exchange.fetch_positions,
+                [symbol],
+                dict(profile.params),
+            )
+        if not isinstance(rows, list):
+            return None
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_symbol = str(row.get("symbol") or symbol)
+            if row_symbol and row_symbol != symbol:
+                continue
+
+            contracts = self._to_float(row.get("contracts"), 0.0)
+            info = row.get("info")
+            if contracts <= 0 and isinstance(info, dict):
+                contracts = max(
+                    self._to_float(info.get("size"), 0.0),
+                    abs(self._to_float(info.get("positionAmt"), 0.0)),
+                )
+            if contracts <= 0:
+                continue
+
+            side_raw: object = row.get("side")
+            if (not side_raw) and isinstance(info, dict):
+                side_raw = info.get("side")
+            side = self._normalize_futures_side(side_raw)
+            if side == "flat":
+                continue
+
+            info_dict = info if isinstance(info, dict) else None
+            take_profit_price = None
+            stop_loss_price = None
+            liquidation_price = None
+            notional = None
+            collateral = None
+            if info_dict is not None:
+                take_profit_price = (
+                    self._to_float(info_dict.get("takeProfit"))
+                    if info_dict.get("takeProfit") is not None
+                    else None
+                )
+                stop_loss_price = (
+                    self._to_float(info_dict.get("stopLoss"))
+                    if info_dict.get("stopLoss") is not None
+                    else None
+                )
+                liquidation_price = (
+                    self._to_float(info_dict.get("liqPrice"))
+                    if info_dict.get("liqPrice") is not None
+                    else None
+                )
+                notional = (
+                    self._to_float(info_dict.get("positionValue"))
+                    if info_dict.get("positionValue") is not None
+                    else None
+                )
+                collateral = (
+                    self._to_float(info_dict.get("positionIM"))
+                    if info_dict.get("positionIM") is not None
+                    else None
+                )
+                if liquidation_price is None and info_dict.get("liquidationPrice") is not None:
+                    liquidation_price = self._to_float(info_dict.get("liquidationPrice"))
+                if notional is None and info_dict.get("notional") is not None:
+                    notional = abs(self._to_float(info_dict.get("notional")))
+                if collateral is None and info_dict.get("isolatedWallet") is not None:
+                    collateral = self._to_float(info_dict.get("isolatedWallet"))
+            margin_mode = self._extract_margin_mode(row, info_dict)
+
+            return NormalizedFuturesPosition(
+                symbol=row_symbol or symbol,
+                side=cast(FuturesPositionSide, side),
+                contracts=contracts,
+                entry_price=(
+                    self._to_float(row.get("entryPrice"))
+                    if row.get("entryPrice") is not None
+                    else None
+                ),
+                mark_price=(
+                    self._to_float(row.get("markPrice"))
+                    if row.get("markPrice") is not None
+                    else None
+                ),
+                leverage=(
+                    self._to_float(row.get("leverage")) if row.get("leverage") is not None else None
+                ),
+                unrealized_pnl=(
+                    self._to_float(row.get("unrealizedPnl"))
+                    if row.get("unrealizedPnl") is not None
+                    else None
+                ),
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+                liquidation_price=liquidation_price,
+                margin_mode=margin_mode,
+                notional=notional,
+                collateral=collateral,
+                raw=row,
+            )
+        return None
+
     async def fetch_ohlcv(self, *, symbol: str, timeframe: str, bars: int) -> list[list[object]]:
         async with self._client() as exchange:
             raw = await self._call_with_retry(exchange.fetch_ohlcv, symbol, timeframe, None, bars)
         return cast(list[list[object]], raw)
 
     @asynccontextmanager
-    async def _client(self) -> AsyncIterator[Any]:
-        exchange_name = self._credentials.exchange_name
+    async def _client(
+        self,
+        *,
+        default_type: str = "spot",
+        exchange_id: str | None = None,
+    ) -> AsyncIterator[Any]:
+        exchange_name = exchange_id or self._credentials.exchange_name
         exchange_cls = getattr(ccxt, exchange_name, None)
         if exchange_cls is None:
             raise ExchangeServiceError(
@@ -657,7 +1260,7 @@ class CcxtAdapter:
             "secret": self._credentials.api_secret,
             "enableRateLimit": True,
             "timeout": self._settings.exchange_http_timeout_seconds * 1000,
-            "options": {"defaultType": "spot"},
+            "options": {"defaultType": default_type},
         }
         if self._credentials.passphrase:
             config["password"] = self._credentials.passphrase
@@ -783,9 +1386,10 @@ class CcxtAdapter:
             return direct
         info = payload.get("info")
         if isinstance(info, dict):
-            order_link_id = info.get("orderLinkId")
-            if isinstance(order_link_id, str) and order_link_id:
-                return order_link_id
+            for key in ("orderLinkId", "clientOrderId", "origClientOrderId"):
+                value = info.get(key)
+                if isinstance(value, str) and value:
+                    return value
         return None
 
     def _normalize_trade(self, payload: dict[str, Any]) -> NormalizedTrade:

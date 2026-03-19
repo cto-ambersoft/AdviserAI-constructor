@@ -88,4 +88,3 @@ async def test_update_strategy_returns_404_for_unknown_id() -> None:
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.put("/api/v1/strategies/9999", json={"name": "Nope"})
     assert response.status_code == 404
-

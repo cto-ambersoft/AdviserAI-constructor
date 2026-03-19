@@ -233,9 +233,7 @@ async def run_portfolio(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Async portfolio jobs do not support user_strategies yet.",
             )
-        task: AsyncTaskiqTask[dict[str, object]] = await run_portfolio_backtest.kiq(
-            request_payload
-        )
+        task: AsyncTaskiqTask[dict[str, object]] = await run_portfolio_backtest.kiq(request_payload)
         return {"status": "queued", "task_id": task.task_id}
     request_payload["session"] = session
     try:

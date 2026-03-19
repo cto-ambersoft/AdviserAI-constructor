@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from app.schemas.exchange_trading import (
@@ -6,6 +7,7 @@ from app.schemas.exchange_trading import (
     ExchangeMode,
     ExchangeName,
     NormalizedBalance,
+    NormalizedFuturesPosition,
     NormalizedOrder,
     NormalizedTrade,
     OrderSide,
@@ -68,11 +70,57 @@ class CexAdapter(Protocol):
         limit: int = 100,
     ) -> list[NormalizedTrade]: ...
 
+    async def fetch_futures_trades(
+        self,
+        *,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+    ) -> list[NormalizedTrade]: ...
+
+    async def fetch_futures_trades_page(
+        self,
+        *,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[NormalizedTrade], str | None]: ...
+
     async def fetch_spot_positions_view(
         self,
         *,
         quote_asset: str = "USDT",
     ) -> list[SpotPositionView]: ...
+
+    async def set_futures_leverage(self, *, symbol: str, leverage: int) -> None: ...
+
+    async def place_futures_market_order(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+    ) -> NormalizedOrder: ...
+
+    async def close_futures_market_reduce_only(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        amount: float,
+        client_order_id: str | None = None,
+    ) -> NormalizedOrder: ...
+
+    async def fetch_futures_position(
+        self,
+        *,
+        symbol: str,
+    ) -> NormalizedFuturesPosition | None: ...
 
     async def fetch_ohlcv(
         self, *, symbol: str, timeframe: str, bars: int

@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.api.deps import get_current_user
 from app.api.v1.endpoints import (
+    accounts,
     ai,
     analysis,
     audit,
@@ -13,7 +14,6 @@ from app.api.v1.endpoints import (
     market,
     personal_analysis,
     strategies,
-    trading,
 )
 
 api_router = APIRouter()
@@ -27,7 +27,7 @@ protected_router.include_router(exchange.router, prefix="/exchange", tags=["exch
 protected_router.include_router(ai.router, prefix="/ai", tags=["ai"])
 protected_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 protected_router.include_router(market.router, prefix="/market", tags=["market"])
-protected_router.include_router(trading.router, prefix="/trading", tags=["trading"])
+protected_router.include_router(accounts.router, prefix="/accounts", tags=["accounts"])
 protected_router.include_router(live.router, prefix="/live", tags=["live"])
 protected_router.include_router(analysis.router, prefix="/analysis", tags=["analysis"])
 protected_router.include_router(

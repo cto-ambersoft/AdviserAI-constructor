@@ -2,6 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.schemas.market import MARKET_EXCHANGE_DEFAULT
+
 VWAP_ALLOWED_INDICATORS = {
     "EMA Fast (21)",
     "EMA Slow (50)",
@@ -59,6 +61,7 @@ class CandleInput(BaseModel):
 
 
 class BaseBacktestRequest(BaseModel):
+    exchange_name: str = Field(default=MARKET_EXCHANGE_DEFAULT, min_length=2, max_length=32)
     symbol: str = Field(default="BTC/USDT", min_length=3, max_length=24)
     timeframe: str = Field(default="1h", min_length=1, max_length=16)
     bars: int = Field(default=500, ge=100, le=20_000)

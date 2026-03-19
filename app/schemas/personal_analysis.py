@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.analysis_normalization import normalize_analysis_payload
 
 PERSONAL_ANALYSIS_AGENT_NAMES = (
     "twitterSentiment",
@@ -193,3 +195,8 @@ class PersonalAnalysisHistoryRead(BaseModel):
     core_completed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("analysis_data", mode="before")
+    @classmethod
+    def normalize_analysis_data(cls, value: Any) -> Any:
+        return normalize_analysis_payload(value)

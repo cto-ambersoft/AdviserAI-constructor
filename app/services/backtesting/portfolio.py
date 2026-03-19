@@ -2,6 +2,7 @@ from typing import Any
 
 import pandas as pd
 
+from app.schemas.market import MARKET_EXCHANGE_DEFAULT
 from app.services.backtesting.atr_order_block import run_atr_order_block
 from app.services.backtesting.common import add_client_summary_fields, annotate_trade_confirmations
 from app.services.backtesting.grid_bot import run_grid_bot
@@ -72,12 +73,13 @@ async def _run_strategy_backtest(
     symbol = str(config.get("symbol", "BTC/USDT"))
     timeframe = str(config.get("timeframe", "1h"))
     bars = int(config.get("bars", 500))
+    exchange_name = str(config.get("exchange_name", MARKET_EXCHANGE_DEFAULT))
     candles = config.get("candles")
     if candles:
         df = market_service.frame_from_candles(candles)
     else:
         df = await market_service.fetch_ohlcv(
-            exchange_name="bybit",
+            exchange_name=exchange_name,
             symbol=symbol,
             timeframe=timeframe,
             bars=bars,

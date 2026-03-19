@@ -3,6 +3,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.schemas.market import MARKET_EXCHANGE_DEFAULT
 from app.services.backtesting.common import PositionSizer
 from app.services.backtesting.stop_logic import compute_stop_loss
 from app.services.backtesting.vwap_builder import (
@@ -39,6 +40,7 @@ class LiveSignalService:
     async def load_market_frame(
         self,
         *,
+        exchange_name: str,
         symbol: str,
         timeframe: str,
         bars: int,
@@ -47,7 +49,7 @@ class LiveSignalService:
         if candles:
             return self._market_data.frame_from_candles(candles)
         return await self._market_data.fetch_ohlcv(
-            exchange_name="bybit",
+            exchange_name=exchange_name,
             symbol=symbol,
             timeframe=timeframe,
             bars=bars,
@@ -55,6 +57,7 @@ class LiveSignalService:
 
     async def compute_builder_signal(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            exchange_name=str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             symbol=str(payload["symbol"]),
             timeframe=str(payload["timeframe"]),
             bars=int(payload["bars"]),
@@ -117,6 +120,7 @@ class LiveSignalService:
 
     async def compute_atr_ob_signal(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            exchange_name=str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             symbol=str(payload["symbol"]),
             timeframe=str(payload["timeframe"]),
             bars=int(payload["bars"]),
@@ -159,7 +163,11 @@ class LiveSignalService:
             return {"has_signal": False, "bar_time": str(work.index[idx]), "reasons": []}
         atr = float(cur["ATR"]) if np.isfinite(cur["ATR"]) else np.nan
         if not np.isfinite(atr) or atr <= 0:
-            return {"has_signal": False, "bar_time": str(work.index[idx]), "reasons": ["ATR missing"]}
+            return {
+                "has_signal": False,
+                "bar_time": str(work.index[idx]),
+                "reasons": ["ATR missing"],
+            }
         entry = float(cur["open"])
         sl = float(ob_low) - ob_buffer_atr * atr
         tp = entry + 0.6 * atr
@@ -174,7 +182,10 @@ class LiveSignalService:
                 f"Prev close inside OB [{float(ob_low):.2f}..{float(ob_high):.2f}]",
                 f"Prev close > EMA{ema_period}",
             ],
-            "sizing": {"allowed": True, "position_value": float(payload.get('allocation_usdt', 1000.0))},
+            "sizing": {
+                "allowed": True,
+                "position_value": float(payload.get("allocation_usdt", 1000.0)),
+            },
             "sl_explain": {
                 "mode": "Order Block (ATR-OB)",
                 "ob_low": float(ob_low),

@@ -137,3 +137,68 @@ async def test_analysis_runs_normalizer_handles_invalid_indicator_recommendation
         {"runs": [{"_id": "r1", "indicatorRecommendations": "legacy-string"}]}
     )
     assert normalized["runs"][0]["indicatorRecommendations"] is None
+
+
+async def test_analysis_runs_normalizer_backfills_flat_from_neutral_bias() -> None:
+    normalized = analysis.analysis_proxy_service._normalize_runs_payload(
+        {
+            "runs": [
+                {
+                    "_id": "r1",
+                    "analysisStructured": {
+                        "bias": "NEUTRAL",
+                        "confidence": 0.65,
+                        "keyLevels": {
+                            "support": 65821.97,
+                            "resistance": 71777,
+                        },
+                    },
+                    "trendExtraction": {
+                        "bull": {"probabilityPct": 45},
+                        "bear": {"probabilityPct": 55},
+                        "flat": {"probabilityPct": 0, "takeProfit": None, "stopLoss": None},
+                    },
+                }
+            ]
+        }
+    )
+    flat = normalized["runs"][0]["trendExtraction"]["flat"]
+    assert flat["probabilityPct"] == 65
+    assert flat["takeProfit"] == 71777
+    assert flat["stopLoss"] == 65821.97
+
+
+async def test_analysis_runs_normalizer_maps_neutral_alias_to_flat() -> None:
+    normalized = analysis.analysis_proxy_service._normalize_runs_payload(
+        {
+            "runs": [
+                {
+                    "_id": "r1",
+                    "trendExtraction": {
+                        "neutral": {"probabilityPct": 33, "takeProfit": 100, "stopLoss": 90},
+                    },
+                }
+            ]
+        }
+    )
+    assert normalized["runs"][0]["trendExtraction"]["flat"]["probabilityPct"] == 33
+
+
+async def test_analysis_payload_normalizer_works_for_single_symbol_response() -> None:
+    normalized = analysis.analysis_proxy_service._normalize_payload(
+        {
+            "analysisStructured": {
+                "bias": "flat",
+                "confidence": 0.42,
+                "keyLevels": {"support": 61000, "resistance": 63000},
+            },
+            "trendExtraction": {
+                "flat": {"probabilityPct": 0, "takeProfit": None, "stopLoss": None}
+            },
+        },
+        normalize_runs=False,
+    )
+    flat = normalized["trendExtraction"]["flat"]
+    assert flat["probabilityPct"] == 42
+    assert flat["takeProfit"] == 63000
+    assert flat["stopLoss"] == 61000

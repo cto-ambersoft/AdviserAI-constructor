@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     personal_analysis_max_attempts: int = 3
     personal_analysis_poll_interval_seconds: int = 60
     personal_analysis_scheduler_loop_enabled: bool = True
+    auto_trade_status_batch_size: int = 100
+    auto_trade_max_attempts: int = 5
+    auto_trade_retry_interval_seconds: int = 60
+    auto_trade_scheduler_loop_enabled: bool = True
     cors_allow_origins: list[str] = ["*"]
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]

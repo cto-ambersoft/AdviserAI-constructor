@@ -40,5 +40,9 @@ class AuditService:
         await session.refresh(row)
         return AuditLogRead.model_validate(row)
 
-    async def create_system_event(self, session: AsyncSession, payload: AuditLogCreate) -> AuditLogRead:
-        return await self.create_event(session=session, payload=payload, actor=AUDIT_GLOBAL_ACTORS[0])
+    async def create_system_event(
+        self, session: AsyncSession, payload: AuditLogCreate
+    ) -> AuditLogRead:
+        return await self.create_event(
+            session=session, payload=payload, actor=AUDIT_GLOBAL_ACTORS[0]
+        )

@@ -1,7 +1,7 @@
 import asyncio
+import math
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-import math
 from pathlib import Path
 
 import pytest
@@ -179,7 +179,9 @@ async def test_live_paper_switch_strategy_preserves_backlog_and_creates_marker(
             strategy_type="intraday_momentum",
             symbol="ETH/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest
+        )
 
         create_profile = await client.put(
             "/api/v1/live/paper/profile",
@@ -213,7 +215,9 @@ async def test_live_paper_switch_strategy_preserves_backlog_and_creates_marker(
         assert poll.status_code == 200
         body = poll.json()
         assert body["profile"]["strategy_id"] == strategy_2_id
-        switch_events = [event for event in body["events"] if event["event_type"] == "strategy_switched"]
+        switch_events = [
+            event for event in body["events"] if event["event_type"] == "strategy_switched"
+        ]
         assert len(switch_events) == 1
         assert switch_events[0]["payload"]["from_strategy_id"] == strategy_1_id
         assert switch_events[0]["payload"]["to_strategy_id"] == strategy_2_id
@@ -254,7 +258,7 @@ async def test_live_paper_switch_while_stopped_starts_only_from_play_time(
                     {
                         "side": "LONG",
                         "entry_time": (now - timedelta(seconds=10)).isoformat(),
-                            "exit_time": (now - timedelta(seconds=1)).isoformat(),
+                        "exit_time": (now - timedelta(seconds=1)).isoformat(),
                         "entry": 120.0,
                         "exit": 122.0,
                         "pnl_usdt": 5.0,
@@ -278,7 +282,9 @@ async def test_live_paper_switch_while_stopped_starts_only_from_play_time(
             strategy_type="intraday_momentum",
             symbol="ETH/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest
+        )
 
         created = await client.put(
             "/api/v1/live/paper/profile",
@@ -348,7 +354,9 @@ async def test_live_paper_poll_sanitizes_nan_in_raw_payload(
             strategy_type="builder_vwap",
             symbol="BTC/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest
+        )
 
         profile = await client.put(
             "/api/v1/live/paper/profile",
@@ -419,7 +427,9 @@ async def test_live_paper_poll_keeps_last_processed_on_max_exit_time(
             strategy_type="builder_vwap",
             symbol="BTC/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest
+        )
 
         created = await client.put(
             "/api/v1/live/paper/profile",
@@ -441,7 +451,9 @@ async def test_live_paper_poll_keeps_last_processed_on_max_exit_time(
         first_last_id = first_body["live_trades_since_start"][-1]["id"]
 
         await asyncio.sleep(2)
-        second_poll = await client.get("/api/v1/live/paper/poll", params={"last_trade_id": first_last_id})
+        second_poll = await client.get(
+            "/api/v1/live/paper/poll", params={"last_trade_id": first_last_id}
+        )
         assert second_poll.status_code == 200
         second_body = second_poll.json()
         assert len(second_body["live_trades_since_start"]) == 1
@@ -495,7 +507,9 @@ async def test_live_paper_play_excludes_historical_backtest_from_metrics(
             strategy_type="builder_vwap",
             symbol="BTC/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest
+        )
 
         created = await client.put(
             "/api/v1/live/paper/profile",
@@ -567,7 +581,9 @@ async def test_live_paper_poll_ignores_static_strategy_candles(
         )
         assert update.status_code == 200
 
-        monkeypatch.setattr(live_endpoint.live_paper_service._backtesting, "run_vwap", _fake_run_vwap)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service._backtesting, "run_vwap", _fake_run_vwap
+        )
 
         profile = await client.put(
             "/api/v1/live/paper/profile",
@@ -604,7 +620,9 @@ async def test_live_paper_poll_returns_200_and_emits_error_event_on_exchange_fai
             strategy_type="builder_vwap",
             symbol="BTC/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _failing_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _failing_run_backtest
+        )
 
         profile = await client.put(
             "/api/v1/live/paper/profile",
@@ -621,7 +639,9 @@ async def test_live_paper_poll_returns_200_and_emits_error_event_on_exchange_fai
         poll = await client.get("/api/v1/live/paper/poll")
         assert poll.status_code == 200
         body = poll.json()
-        error_events = [event for event in body["events"] if event["event_type"] == "paper_poll_error"]
+        error_events = [
+            event for event in body["events"] if event["event_type"] == "paper_poll_error"
+        ]
         assert len(error_events) >= 1
         assert error_events[-1]["payload"]["code"] == "temporary_unavailable"
 
@@ -653,7 +673,9 @@ async def test_live_paper_split_arrays_are_stateful_not_incremental(
             strategy_type="builder_vwap",
             symbol="BTC/USDT",
         )
-        monkeypatch.setattr(live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest)
+        monkeypatch.setattr(
+            live_endpoint.live_paper_service, "_run_backtest_for_strategy", _fake_run_backtest
+        )
 
         created = await client.put(
             "/api/v1/live/paper/profile",

@@ -159,7 +159,9 @@ async def test_strategy_create_and_update_write_indicator_audit_events(
     async with session_factory() as session:
         rows = await session.scalars(
             select(AuditLog)
-            .where(AuditLog.actor == "indicators@example.com", AuditLog.target_id == str(strategy_id))
+            .where(
+                AuditLog.actor == "indicators@example.com", AuditLog.target_id == str(strategy_id)
+            )
             .order_by(AuditLog.created_at.asc())
         )
         events = rows.all()

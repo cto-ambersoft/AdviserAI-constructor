@@ -211,7 +211,24 @@ async def test_personal_analysis_history_and_latest(
             profile_id=profile.id,
             trade_job_id=job.id,
             symbol="BTCUSDT",
-            analysis_data={"analysisReport": "ok"},
+            analysis_data={
+                "analysisReport": "ok",
+                "analysisStructured": {
+                    "bias": "NEUTRAL",
+                    "confidence": 0.65,
+                    "keyLevels": {
+                        "support": 65821.97,
+                        "resistance": 71777,
+                    },
+                },
+                "trendExtraction": {
+                    "neutral": {
+                        "probabilityPct": 0,
+                        "takeProfit": None,
+                        "stopLoss": None,
+                    }
+                },
+            },
             core_completed_at=now - timedelta(minutes=1),
         )
         session.add(history)
@@ -223,6 +240,10 @@ async def test_personal_analysis_history_and_latest(
         assert history_resp.status_code == 200
         assert len(history_resp.json()) == 1
         assert history_resp.json()[0]["analysis_data"]["analysisReport"] == "ok"
+        flat = history_resp.json()[0]["analysis_data"]["trendExtraction"]["flat"]
+        assert flat["probabilityPct"] == 65
+        assert flat["takeProfit"] == 71777
+        assert flat["stopLoss"] == 65821.97
 
         latest_resp = await client.get(
             "/api/v1/analysis/personal/latest",
@@ -230,3 +251,5 @@ async def test_personal_analysis_history_and_latest(
         )
         assert latest_resp.status_code == 200
         assert latest_resp.json()["trade_job_id"] == "job-1"
+        latest_flat = latest_resp.json()["analysis_data"]["trendExtraction"]["flat"]
+        assert latest_flat["probabilityPct"] == 65

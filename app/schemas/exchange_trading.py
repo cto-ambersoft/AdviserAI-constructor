@@ -8,6 +8,7 @@ ExchangeMode = Literal["demo", "real"]
 OrderSide = Literal["buy", "sell"]
 OrderType = Literal["market", "limit"]
 OrderStatus = Literal["open", "closed", "canceled", "rejected", "expired", "unknown"]
+FuturesPositionSide = Literal["long", "short", "flat"]
 
 SUPPORTED_EXCHANGES: tuple[ExchangeName, ...] = ("bybit", "binance", "okx")
 SUPPORTED_EXCHANGE_MODES: tuple[ExchangeMode, ...] = ("demo", "real")
@@ -48,6 +49,23 @@ class NormalizedTrade(BaseModel):
     fee_cost: float = Field(ge=0, default=0.0)
     fee_currency: str | None = None
     timestamp: datetime | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class NormalizedFuturesPosition(BaseModel):
+    symbol: str
+    side: FuturesPositionSide
+    contracts: float = Field(ge=0)
+    entry_price: float | None = None
+    mark_price: float | None = None
+    leverage: float | None = None
+    unrealized_pnl: float | None = None
+    take_profit_price: float | None = None
+    stop_loss_price: float | None = None
+    liquidation_price: float | None = None
+    margin_mode: Literal["cross", "isolated"] | None = None
+    notional: float | None = None
+    collateral: float | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -143,3 +161,47 @@ class SpotPnlRead(BaseModel):
     unrealized_pnl_quote: float
     total_fees_quote: float
     assets: list[SpotPnlAsset]
+
+
+class AccountTradeRead(BaseModel):
+    exchange_trade_id: str
+    timestamp: datetime
+    side: str
+    price: float = Field(ge=0)
+    amount: float = Field(ge=0)
+    fee: float = Field(ge=0)
+    fee_currency: str | None = None
+    order_id: str | None = None
+    is_autotrade: bool = False
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class AccountTradesPnlRead(BaseModel):
+    realized: float
+    unrealized: float
+    base_currency: str
+    quote_currency: str
+
+
+class AccountTradesSyncStateRead(BaseModel):
+    last_trade_id: str | None = None
+    last_trade_ts: datetime | None = None
+
+
+class AccountAutoTradeEventRead(BaseModel):
+    id: int
+    event_type: str
+    level: str
+    message: str | None = None
+    created_at: datetime
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AccountTradesRead(BaseModel):
+    account_id: int = Field(ge=1)
+    symbol: str
+    trades: list[AccountTradeRead] = Field(default_factory=list)
+    pnl: AccountTradesPnlRead
+    sync_state: AccountTradesSyncStateRead
+    auto_trade_events: list[AccountAutoTradeEventRead] = Field(default_factory=list)
+    sync_warnings: list[str] = Field(default_factory=list)

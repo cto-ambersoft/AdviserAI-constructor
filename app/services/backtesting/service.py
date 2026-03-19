@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.strategy import Strategy
+from app.schemas.market import MARKET_EXCHANGE_DEFAULT
 from app.services.backtesting.atr_order_block import run_atr_order_block
 from app.services.backtesting.grid_bot import run_grid_bot
 from app.services.backtesting.intraday_momentum import run_intraday_momentum
@@ -21,6 +22,7 @@ class BacktestingService:
 
     async def load_market_frame(
         self,
+        exchange_name: str,
         symbol: str,
         timeframe: str,
         bars: int,
@@ -29,7 +31,7 @@ class BacktestingService:
         if candles:
             return self.market_data.frame_from_candles(candles)
         return await self.market_data.fetch_ohlcv(
-            exchange_name="bybit",
+            exchange_name=exchange_name,
             symbol=symbol,
             timeframe=timeframe,
             bars=bars,
@@ -37,6 +39,7 @@ class BacktestingService:
 
     async def run_vwap(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            exchange_name=str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             symbol=payload["symbol"],
             timeframe=payload["timeframe"],
             bars=payload["bars"],
@@ -47,6 +50,7 @@ class BacktestingService:
 
     async def run_atr_order_block(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             payload["symbol"],
             payload["timeframe"],
             payload["bars"],
@@ -56,6 +60,7 @@ class BacktestingService:
 
     async def run_knife(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             payload["symbol"],
             payload["timeframe"],
             payload["bars"],
@@ -65,6 +70,7 @@ class BacktestingService:
 
     async def run_grid(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             payload["symbol"],
             payload["timeframe"],
             payload["bars"],
@@ -74,6 +80,7 @@ class BacktestingService:
 
     async def run_intraday(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self.load_market_frame(
+            str(payload.get("exchange_name", MARKET_EXCHANGE_DEFAULT)),
             payload["symbol"],
             payload["timeframe"],
             payload["bars"],
@@ -87,7 +94,11 @@ class BacktestingService:
         user_id = int(user_id_raw) if user_id_raw is not None else None
         session = payload.get("session")
         if not strategies and user_id and isinstance(session, AsyncSession):
-            strategies = await self._resolve_portfolio_strategies(payload, session=session, user_id=user_id)
+            strategies = await self._resolve_portfolio_strategies(
+                payload,
+                session=session,
+                user_id=user_id,
+            )
         total_capital = float(payload.get("total_capital", 0.0))
         return await run_portfolio(strategies, total_capital, self.market_data)
 

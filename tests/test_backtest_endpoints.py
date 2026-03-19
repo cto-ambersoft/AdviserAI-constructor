@@ -1,6 +1,6 @@
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from collections.abc import AsyncIterator
 
 import pandas as pd
 import pytest
@@ -160,11 +160,13 @@ async def test_vwap_backtest_uses_backend_market_fetch_when_candles_absent(
     captured: dict[str, object] = {}
 
     async def _fake_load_market_frame(
+        exchange_name: str,
         symbol: str,
         timeframe: str,
         bars: int,
         candles: list[dict[str, object]] | None = None,
     ) -> pd.DataFrame:
+        captured["exchange_name"] = exchange_name
         captured["symbol"] = symbol
         captured["timeframe"] = timeframe
         captured["bars"] = bars
@@ -206,6 +208,7 @@ async def test_vwap_backtest_uses_backend_market_fetch_when_candles_absent(
         response = await client.post("/api/v1/backtest/vwap", json=payload)
     assert response.status_code == 200
     assert captured == {
+        "exchange_name": "bybit",
         "symbol": "BTC/USDT",
         "timeframe": "1h",
         "bars": 140,
@@ -248,13 +251,13 @@ async def test_portfolio_backtest_supports_user_and_builtin_split_payload(
             {
                 "name": "Saved VWAP",
                 "weight": 70.0,
-                    "config": {"strategy_type": "manual"},
+                "config": {"strategy_type": "manual"},
                 "trades": [{"exit_time": "2025-01-01T00:00:00+00:00", "pnl_usdt": 100.0}],
             },
             {
                 "name": "Grid BOT",
                 "weight": 30.0,
-                    "config": {"strategy_type": "manual"},
+                "config": {"strategy_type": "manual"},
                 "trades": [{"exit_time": "2025-01-02T00:00:00+00:00", "pnl_usdt": -50.0}],
             },
         ]

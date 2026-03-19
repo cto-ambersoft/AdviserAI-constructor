@@ -40,13 +40,15 @@ trade_platform/
    - `uv sync`
 2. Copy environment:
    - `cp .env.example .env`
-3. Run API in dev mode:
+3. Apply DB migrations:
+   - `uv run alembic upgrade head`
+4. Run API in dev mode:
    - `uv run uvicorn app.main:app --reload`
-4. Run worker:
+5. Run worker:
    - `uv run taskiq worker app.worker.broker:broker app.worker.tasks`
-5. Run scheduler:
+6. Run scheduler:
    - `uv run taskiq scheduler app.worker.scheduler:scheduler app.worker.tasks`
-6. Run API in production style:
+7. Run API in production style:
    - `uv run gunicorn -k uvicorn.workers.UvicornWorker app.main:app -w 4 -b 0.0.0.0:8000`
 
 ## Quality gates
@@ -81,6 +83,13 @@ trade_platform/
 - `POST /api/v1/live/paper/play`
 - `POST /api/v1/live/paper/stop`
 - `GET /api/v1/live/paper/poll`
+- `GET /api/v1/live/auto-trade/config`
+- `PUT /api/v1/live/auto-trade/config`
+- `POST /api/v1/live/auto-trade/play`
+- `POST /api/v1/live/auto-trade/stop`
+- `GET /api/v1/live/auto-trade/state`
+- `GET /api/v1/live/auto-trade/events`
+- `GET /api/v1/live/auto-trade/trades`
 - `POST /api/v1/analysis/trigger-now`
 - `GET /api/v1/analysis/runs`
 - `GET /api/v1/analysis/runs?limit=1`
@@ -173,10 +182,34 @@ Personal analysis pipeline configuration:
 - `PERSONAL_ANALYSIS_MAX_ATTEMPTS` (default `3`)
 - `PERSONAL_ANALYSIS_POLL_INTERVAL_SECONDS` (default `60`)
 - `PERSONAL_ANALYSIS_SCHEDULER_LOOP_ENABLED` (default `true`)
+- `AUTO_TRADE_STATUS_BATCH_SIZE` (default `100`)
+- `AUTO_TRADE_MAX_ATTEMPTS` (default `5`)
+- `AUTO_TRADE_RETRY_INTERVAL_SECONDS` (default `60`)
+- `AUTO_TRADE_SCHEDULER_LOOP_ENABLED` (default `true`)
 - `TASKIQ_STREAM_MAXLEN` (default `10000`)
 - `TASKIQ_RESULT_KEEP_RESULTS` (default `false`)
 - `TASKIQ_RESULT_EX_TIME_SECONDS` (default `1800`)
 - `TASKIQ_RESULT_KEY_PREFIX` (default `taskiq:result`)
+
+Auto-trade exchange ledger behavior:
+
+- Exchange fills are synchronized into local DB as canonical source-of-truth.
+- New storage tables:
+  - `exchange_trade_ledger` - normalized exchange fills with origin markers (`platform|external|unknown`).
+  - `exchange_trade_sync_state` - per `(account_id, symbol, market_type)` high-water marks for incremental sync.
+  - `exchange_order_metadata` - order provenance map written by auto-trade execution.
+- Sync strategy:
+  - backfill for managed auto-trade symbols (30 days on first sync),
+  - incremental sync with overlap window and idempotent upsert to avoid misses/duplicates.
+- Auto-trade runtime writes deterministic `client_order_id` and records metadata for robust reconciliation.
+- Background task `sync_auto_trade_exchange_trades` runs every minute via Taskiq scheduler.
+- `GET /api/v1/live/auto-trade/trades` returns synchronized ledger rows and summary.
+
+Operational notes:
+
+- `auto_trade_positions` remains as strategy lifecycle state (open/close/reason/risk context).
+- `exchange_trade_ledger` remains execution truth from exchange.
+- Keep both worker and scheduler running for continuous sync.
 
 ## Documentation notes (Context7 aligned)
 

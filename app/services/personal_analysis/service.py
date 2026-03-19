@@ -15,6 +15,7 @@ from app.schemas.personal_analysis import (
     PersonalAnalysisProfileUpdate,
     normalize_agents_and_weights,
 )
+from app.services.auto_trade.service import AutoTradeService
 from app.services.personal_analysis.http_provider import HttpPollingAnalysisProvider
 from app.services.personal_analysis.provider import (
     AnalysisProvider,
@@ -43,6 +44,7 @@ def _normalize_status(value: str) -> str:
 class PersonalAnalysisService:
     def __init__(self, provider: AnalysisProvider | None = None) -> None:
         self._provider = provider or HttpPollingAnalysisProvider()
+        self._auto_trade = AutoTradeService()
         settings = get_settings()
         self._status_batch_size = settings.personal_analysis_status_batch_size
         self._max_attempts = settings.personal_analysis_max_attempts
@@ -470,16 +472,21 @@ class PersonalAnalysisService:
         existing_history = await session.scalar(
             select(PersonalAnalysisHistory).where(PersonalAnalysisHistory.trade_job_id == job.id)
         )
+        created_history: PersonalAnalysisHistory | None = None
         if existing_history is None:
-            session.add(
-                PersonalAnalysisHistory(
-                    user_id=job.user_id,
-                    profile_id=job.profile_id,
-                    trade_job_id=job.id,
-                    symbol=str(job.payload_json.get("symbol") or ""),
-                    analysis_data=result.result_json,
-                    core_completed_at=result.completed_at,
-                )
+            created_history = PersonalAnalysisHistory(
+                user_id=job.user_id,
+                profile_id=job.profile_id,
+                trade_job_id=job.id,
+                symbol=str(job.payload_json.get("symbol") or ""),
+                analysis_data=result.result_json,
+                core_completed_at=result.completed_at,
+            )
+            session.add(created_history)
+            await session.flush()
+            await self._auto_trade.enqueue_history_signal(
+                session=session,
+                history=created_history,
             )
 
         profile = await session.get(PersonalAnalysisProfile, job.profile_id)

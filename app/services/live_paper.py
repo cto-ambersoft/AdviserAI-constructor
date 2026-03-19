@@ -1,5 +1,5 @@
-from datetime import UTC, datetime
 import math
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Select, desc, func, select
@@ -44,7 +44,9 @@ class LivePaperService:
         user_id: int,
         payload: LivePaperProfileUpsertRequest,
     ) -> LivePaperProfile:
-        strategy = await self._get_user_strategy(session, user_id=user_id, strategy_id=payload.strategy_id)
+        strategy = await self._get_user_strategy(
+            session, user_id=user_id, strategy_id=payload.strategy_id
+        )
         profile = await self._get_profile(session=session, user_id=user_id, for_update=True)
         now = datetime.now(UTC)
 
@@ -362,7 +364,9 @@ class LivePaperService:
         session: AsyncSession,
         profile: LivePaperProfile,
     ) -> dict[str, Any]:
-        current_initial_balance = await self._resolve_current_initial_balance(session=session, profile=profile)
+        current_initial_balance = await self._resolve_current_initial_balance(
+            session=session, profile=profile
+        )
         stats_start_time = await self._resolve_stats_start_time(session=session, profile=profile)
         base_filters = [
             LivePaperTrade.profile_id == profile.id,
@@ -371,7 +375,9 @@ class LivePaperService:
         if stats_start_time is not None:
             base_filters.append(LivePaperTrade.exit_time > stats_start_time)
 
-        sum_stmt = select(func.coalesce(func.sum(LivePaperTrade.pnl_usdt), 0.0)).where(*base_filters)
+        sum_stmt = select(func.coalesce(func.sum(LivePaperTrade.pnl_usdt), 0.0)).where(
+            *base_filters
+        )
         total_pnl = float((await session.scalar(sum_stmt)) or 0.0)
         count_stmt = select(func.count(LivePaperTrade.id)).where(*base_filters)
         total_trades = int((await session.scalar(count_stmt)) or 0)
@@ -421,7 +427,9 @@ class LivePaperService:
             .limit(1)
         )
         if started_event is not None:
-            started_payload = started_event.payload if isinstance(started_event.payload, dict) else {}
+            started_payload = (
+                started_event.payload if isinstance(started_event.payload, dict) else {}
+            )
             started_balance = started_payload.get("total_balance_usdt")
             try:
                 if started_balance is not None:

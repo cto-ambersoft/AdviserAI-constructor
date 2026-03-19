@@ -16,6 +16,13 @@ def normalize_exchange_name(raw_value: str) -> ExchangeName:
     return cast(ExchangeName, normalized)
 
 
+def resolve_ccxt_exchange_id(exchange_name: ExchangeName, *, market: str = "spot") -> str:
+    if market == "futures" and exchange_name == "binance":
+        # USDT-M futures in CCXT are exposed as a dedicated exchange class.
+        return "binanceusdm"
+    return exchange_name
+
+
 def create_cex_adapter(credentials: ExchangeCredentials) -> CexAdapter:
     exchange_name = normalize_exchange_name(credentials.exchange_name)
     return CcxtAdapter(

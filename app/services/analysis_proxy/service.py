@@ -4,6 +4,7 @@ import httpx
 from fastapi import HTTPException, status
 from fastapi.responses import JSONResponse, Response
 
+from app.core.analysis_normalization import normalize_analysis_payload
 from app.core.config import get_settings
 
 
@@ -53,10 +54,15 @@ class AnalysisProxyService:
         content_type = resp.headers.get("content-type", "").lower()
         if "application/json" in content_type:
             payload: Any = resp.json()
-            if normalize_runs:
-                payload = self._normalize_runs_payload(payload)
+            payload = self._normalize_payload(payload, normalize_runs=normalize_runs)
             return JSONResponse(content=payload, status_code=resp.status_code)
         return Response(content=resp.content, status_code=resp.status_code, media_type=content_type)
+
+    @staticmethod
+    def _normalize_payload(payload: Any, *, normalize_runs: bool) -> Any:
+        if normalize_runs:
+            return AnalysisProxyService._normalize_runs_payload(payload)
+        return normalize_analysis_payload(payload)
 
     @staticmethod
     def _normalize_runs_payload(payload: Any) -> Any:
@@ -66,19 +72,6 @@ class AnalysisProxyService:
         if not isinstance(runs, list):
             return payload
 
-        normalized_runs: list[Any] = []
-        for run in runs:
-            if not isinstance(run, dict):
-                normalized_runs.append(run)
-                continue
-            normalized = dict(run)
-            if "indicatorRecommendations" not in normalized:
-                normalized["indicatorRecommendations"] = None
-            elif normalized["indicatorRecommendations"] is not None and not isinstance(
-                normalized["indicatorRecommendations"], dict
-            ):
-                normalized["indicatorRecommendations"] = None
-            normalized_runs.append(normalized)
         normalized_payload = dict(payload)
-        normalized_payload["runs"] = normalized_runs
+        normalized_payload["runs"] = [normalize_analysis_payload(run) for run in runs]
         return normalized_payload

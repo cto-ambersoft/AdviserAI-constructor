@@ -90,7 +90,9 @@ async def update_strategy(
     session: DbSession,
     current_user: CurrentUser,
 ) -> StrategyRead:
-    before = await strategy_service.get_strategy(session, strategy_id=strategy_id, user_id=current_user.id)
+    before = await strategy_service.get_strategy(
+        session, strategy_id=strategy_id, user_id=current_user.id
+    )
     if before is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Strategy not found.")
     try:

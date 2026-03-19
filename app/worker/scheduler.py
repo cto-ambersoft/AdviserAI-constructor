@@ -7,4 +7,3 @@ scheduler = TaskiqScheduler(
     broker=broker,
     sources=[LabelScheduleSource(broker)],
 )
-
