@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.schemas.strategy_profile import StrategyProfileConfig
+
 RiskMode = str
 PositionSide = Literal["LONG", "SHORT"]
 PositionStatus = Literal["open", "closed", "error"]
@@ -41,6 +43,7 @@ class AutoTradeConfigUpsertRequest(BaseModel):
     risk_mode: RiskMode = "1:2"
     sl_pct: float = Field(gt=0)
     tp_pct: float = Field(gt=0)
+    strategy_profile: StrategyProfileConfig | None = None
 
     @model_validator(mode="after")
     def validate_risk_mode_ratio(self) -> "AutoTradeConfigUpsertRequest":
@@ -75,6 +78,7 @@ class AutoTradeConfigRead(BaseModel):
     risk_mode: RiskMode
     sl_pct: float
     tp_pct: float
+    strategy_profile: StrategyProfileConfig | None = None
     last_started_at: datetime | None
     last_stopped_at: datetime | None
     created_at: datetime

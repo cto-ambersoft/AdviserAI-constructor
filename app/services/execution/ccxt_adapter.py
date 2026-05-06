@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, SupportsFloat, cast
 
 import ccxt.async_support as ccxt
+import pandas as pd
 
 from app.core.config import get_settings
 from app.schemas.exchange_trading import (
@@ -1235,10 +1236,97 @@ class CcxtAdapter:
             )
         return None
 
-    async def fetch_ohlcv(self, *, symbol: str, timeframe: str, bars: int) -> list[list[object]]:
+    async def fetch_ohlcv(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        bars: int,
+        market_type: Literal["spot", "futures"] = "spot",
+        start_time: str | None = None,
+        end_time: str | None = None,
+    ) -> list[list[object]]:
+        since_ms = self._parse_time_ms(start_time)
+        end_ms = self._parse_time_ms(end_time)
+        if market_type == "futures":
+            profile = self._ensure_futures_supported()
+            async with self._client(
+                default_type=profile.default_type,
+                exchange_id=profile.exchange_id,
+            ) as exchange:
+                if since_ms is not None:
+                    raw = await self._fetch_ohlcv_range(
+                        exchange,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        since_ms=since_ms,
+                        end_ms=end_ms,
+                        limit=bars,
+                        params=profile.params,
+                    )
+                else:
+                    call_args: list[object] = [symbol, timeframe, None, bars]
+                    if profile.params:
+                        call_args.append(profile.params)
+                    raw = await self._call_with_retry(exchange.fetch_ohlcv, *call_args)
+            return cast(list[list[object]], raw)
+
         async with self._client() as exchange:
-            raw = await self._call_with_retry(exchange.fetch_ohlcv, symbol, timeframe, None, bars)
+            if since_ms is not None:
+                raw = await self._fetch_ohlcv_range(
+                    exchange,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    since_ms=since_ms,
+                    end_ms=end_ms,
+                    limit=bars,
+                    params=None,
+                )
+            else:
+                raw = await self._call_with_retry(exchange.fetch_ohlcv, symbol, timeframe, None, bars)
         return cast(list[list[object]], raw)
+
+    async def _fetch_ohlcv_range(
+        self,
+        exchange: Any,
+        *,
+        symbol: str,
+        timeframe: str,
+        since_ms: int,
+        end_ms: int | None,
+        limit: int,
+        params: dict[str, object] | None,
+    ) -> list[list[object]]:
+        rows: list[list[object]] = []
+        cursor = since_ms
+        max_batch = min(max(limit, 1), 1000)
+        while len(rows) < limit:
+            call_args: list[object] = [symbol, timeframe, cursor, max_batch]
+            if params:
+                call_args.append(params)
+            batch = cast(list[list[object]], await self._call_with_retry(exchange.fetch_ohlcv, *call_args))
+            if not batch:
+                break
+            for item in batch:
+                ts = int(item[0])
+                if end_ms is not None and ts > end_ms:
+                    return rows[:limit]
+                if ts >= since_ms:
+                    rows.append(item)
+            next_cursor = int(batch[-1][0]) + 1
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+        return rows[:limit]
+
+    @staticmethod
+    def _parse_time_ms(value: str | None) -> int | None:
+        if not value:
+            return None
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return int(parsed.timestamp() * 1000)
 
     @asynccontextmanager
     async def _client(
@@ -1279,18 +1367,18 @@ class CcxtAdapter:
 
     @staticmethod
     def _configure_demo_mode(exchange: Any) -> None:
-        # Bybit has dedicated demo trading domains, which differ from plain testnet.
-        # Prefer CCXT demo mode when available; fallback to sandbox for exchanges without it.
-        try:
-            exchange.enable_demo_trading(True)
+        exchange_id = str(getattr(exchange, "id", "")).strip().lower()
+        enable_demo = getattr(exchange, "enable_demo_trading", None)
+        if callable(enable_demo):
+            enable_demo(True)
             return
-        except Exception:
-            pass
-        try:
-            exchange.set_sandbox_mode(True)
-        except Exception:
-            # Some exchanges do not support either mode switch in CCXT.
-            return
+
+        if exchange_id in {"binance", "binanceusdm", "bybit"}:
+            raise RuntimeError(f"CCXT exchange '{exchange_id}' does not support demo trading.")
+
+        set_sandbox_mode = getattr(exchange, "set_sandbox_mode", None)
+        if callable(set_sandbox_mode):
+            set_sandbox_mode(True)
 
     async def _call_with_retry(
         self,

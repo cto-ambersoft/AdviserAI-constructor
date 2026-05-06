@@ -65,6 +65,14 @@ class BaseBacktestRequest(BaseModel):
     symbol: str = Field(default="BTC/USDT", min_length=3, max_length=24)
     timeframe: str = Field(default="1h", min_length=1, max_length=16)
     bars: int = Field(default=500, ge=100, le=20_000)
+    start_time: str | None = Field(
+        default=None,
+        description="Optional inclusive OHLCV start time (ISO datetime).",
+    )
+    end_time: str | None = Field(
+        default=None,
+        description="Optional inclusive OHLCV end time (ISO datetime).",
+    )
     candles: list[CandleInput] | None = Field(
         default=None,
         description=(
@@ -105,6 +113,10 @@ class VwapBacktestRequest(BaseBacktestRequest):
     ob_impulse_atr: float = Field(default=1.5, ge=0.1, le=10.0)
     ob_buffer_atr: float = Field(default=0.15, ge=0, le=10.0)
     ob_lookback: int = Field(default=120, ge=5, le=5000)
+    run_with_ai: bool = False
+    ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
+    ai_bull_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_bear_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
 
     @field_validator("enabled")
     @classmethod
@@ -113,6 +125,12 @@ class VwapBacktestRequest(BaseBacktestRequest):
         if unknown:
             raise ValueError(f"Unknown indicators: {', '.join(unknown)}")
         return value
+
+    @model_validator(mode="after")
+    def validate_ai_config(self) -> "VwapBacktestRequest":
+        if self.run_with_ai and not self.ai_forecast_file:
+            raise ValueError("ai_forecast_file is required when run_with_ai=true.")
+        return self
 
 
 class AtrOrderBlockRequest(BaseBacktestRequest):
@@ -123,6 +141,12 @@ class AtrOrderBlockRequest(BaseBacktestRequest):
     tp_levels: list[tuple[float, float]] | None = None
     one_trade_per_ob: bool = True
     allocation_usdt: float = Field(default=1000.0, gt=0)
+    run_with_ai: bool = False
+    ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
+    ai_forecast_rows: list[dict[str, Any]] | None = None
+    ai_bull_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_bear_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_entry_side_lock: bool = True
 
 
 class KnifeCatcherRequest(BaseBacktestRequest):
@@ -140,6 +164,12 @@ class KnifeCatcherRequest(BaseBacktestRequest):
     requote_each_candle: bool = True
     max_requotes: int = 6
     account_balance: float = Field(default=1000.0, gt=0)
+    run_with_ai: bool = False
+    ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
+    ai_forecast_rows: list[dict[str, Any]] | None = None
+    ai_bull_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_bear_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_entry_side_lock: bool = True
 
 
 class GridBotRequest(BaseBacktestRequest):
@@ -151,6 +181,11 @@ class GridBotRequest(BaseBacktestRequest):
     initial_capital_usdt: float | None = Field(default=None, gt=0)
     order_size_usdt: float | None = Field(default=None, gt=0)
     close_open_positions_on_eod: bool = True
+    run_with_ai: bool = False
+    ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
+    ai_forecast_rows: list[dict[str, Any]] | None = None
+    ai_bull_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_bear_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
 
 
 class IntradayMomentumRequest(BaseBacktestRequest):
@@ -167,6 +202,12 @@ class IntradayMomentumRequest(BaseBacktestRequest):
     max_positions: int = 1
     fee_pct: float = 0.06
     entry_size_usdt: float | None = Field(default=None, gt=0)
+    run_with_ai: bool = False
+    ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
+    ai_forecast_rows: list[dict[str, Any]] | None = None
+    ai_bull_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_bear_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_entry_side_lock: bool = True
 
 
 class PortfolioStrategyInput(BaseModel):
@@ -201,6 +242,12 @@ class PortfolioBacktestRequest(BaseModel):
     builtin_strategies: list[PortfolioBuiltinStrategyInput] = Field(default_factory=list)
     # Backward-compatible legacy payload path.
     strategies: list[PortfolioStrategyInput] = Field(default_factory=list)
+    run_with_ai: bool = False
+    ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
+    ai_forecast_rows: list[dict[str, Any]] | None = None
+    ai_bull_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_bear_confidence_threshold: float | None = Field(default=None, ge=0.0, le=100.0)
+    ai_entry_side_lock: bool = True
     async_job: bool = False
 
     @model_validator(mode="after")
@@ -223,6 +270,44 @@ class BacktestResponse(BaseModel):
     trades: list[dict[str, Any]]
     chart_points: dict[str, Any]
     explanations: list[Any]
+
+
+class VwapAiComparisonDelta(BaseModel):
+    total_pnl_delta: float
+    win_rate_delta: float
+    trades_delta: int
+    profit_factor_delta: float = 0.0
+    sharpe_proxy_delta: float = 0.0
+    max_drawdown_delta: float = 0.0
+    calmar_ratio_delta: float = 0.0
+
+
+class VwapAiComparisonResponse(BaseModel):
+    result: BacktestResponse
+    baseline: BacktestResponse
+    comparison: VwapAiComparisonDelta
+
+
+class AiForecastBacktestFile(BaseModel):
+    file_name: str
+    modified_at_utc: str
+
+
+class AiForecastBacktestFilesResponse(BaseModel):
+    files: list[AiForecastBacktestFile]
+
+
+class InternalBacktestCompareRequest(BaseModel):
+    strategy: str = "vwap"
+    exchange_name: str = Field(default=MARKET_EXCHANGE_DEFAULT, min_length=2, max_length=32)
+    symbol: str = Field(default="BTC/USDT", min_length=3, max_length=24)
+    timeframe: str = Field(default="1h", min_length=1, max_length=16)
+    bars: int = Field(default=500, ge=100, le=20_000)
+    start_time: str | None = None
+    end_time: str | None = None
+    algo_config: dict[str, Any] = Field(default_factory=dict)
+    data_config: dict[str, Any] = Field(default_factory=dict)
+    ai_forecast_rows: list[dict[str, Any]]
 
 
 class VwapCatalog(BaseModel):

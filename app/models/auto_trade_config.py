@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -60,5 +61,10 @@ class AutoTradeConfig(Base, TimestampMixin):
     risk_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="1:2")
     sl_pct: Mapped[float] = mapped_column(Float(), nullable=False, default=1.0)
     tp_pct: Mapped[float] = mapped_column(Float(), nullable=False, default=2.0)
+    strategy_profile_json: Mapped[dict[str, object] | None] = mapped_column(JSON(), nullable=True)
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def strategy_profile(self) -> dict[str, object] | None:
+        return self.strategy_profile_json

@@ -2,11 +2,13 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.services.auto_trade.service as auto_trade_service_module
 from app.models.auto_trade_config import AutoTradeConfig
 from app.models.auto_trade_event import AutoTradeEvent
 from app.models.auto_trade_position import AutoTradePosition
@@ -26,6 +28,13 @@ from app.schemas.exchange_trading import (
     OrderSide,
     SpotOrderRead,
 )
+from app.services.exchange.adapter import (
+    ConditionalOrderResult,
+    EntryOrderResult,
+    OrderSide as ExchangeOrderSide,
+)
+from app.services.position.context import PositionContext
+from app.services.position.state_machine import PositionState
 from app.services.auto_trade.service import AutoTradeService
 from app.services.execution.errors import ExchangeServiceError
 
@@ -41,17 +50,29 @@ class _FakeTradingService:
         self.order_calls: list[dict[str, object]] = []
         self.fetch_position_calls: list[str] = []
         self._counter = 0
-        self._positions: dict[str, tuple[str, float]] = {}
+        self._positions: dict[tuple[int | None, str], tuple[str, float]] = {}
         self._trades: dict[str, list[NormalizedTrade]] = {}
         self._fail_close_order_attempts = fail_close_order_attempts
         self._stale_position_reads_after_close = stale_position_reads_after_close
         self._stale_reads_remaining = 0
 
-    def set_external_position(self, *, symbol: str, side: str, contracts: float) -> None:
-        self._positions[symbol] = (side, float(contracts))
+    def set_external_position(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        contracts: float,
+        account_id: int | None = None,
+    ) -> None:
+        self._positions[(account_id, symbol)] = (side, float(contracts))
 
-    def clear_external_position(self, *, symbol: str) -> None:
-        self._positions.pop(symbol, None)
+    def clear_external_position(self, *, symbol: str, account_id: int | None = None) -> None:
+        if account_id is not None:
+            self._positions.pop((account_id, symbol), None)
+            return
+        for key in list(self._positions):
+            if key[1] == symbol:
+                self._positions.pop(key, None)
 
     def set_symbol_trades(self, *, symbol: str, trades: list[NormalizedTrade]) -> None:
         self._trades[symbol] = trades
@@ -103,9 +124,10 @@ class _FakeTradingService:
         )
         if not reduce_only:
             position_side = "long" if side == "buy" else "short"
-            self._positions[symbol] = (position_side, float(amount))
+            self._positions[(account_id, symbol)] = (position_side, float(amount))
         else:
-            self._positions.pop(symbol, None)
+            self._positions.pop((account_id, symbol), None)
+            self._positions.pop((None, symbol), None)
             self._stale_reads_remaining = self._stale_position_reads_after_close
 
         fill_price = 100.0 if not reduce_only else 95.0
@@ -165,7 +187,9 @@ class _FakeTradingService:
         symbol: str,
     ) -> NormalizedFuturesPosition | None:
         self.fetch_position_calls.append(symbol)
-        position = self._positions.get(symbol)
+        position = self._positions.get((account_id, symbol))
+        if position is None:
+            position = self._positions.get((None, symbol))
         if position is None:
             if self._stale_reads_remaining > 0:
                 self._stale_reads_remaining -= 1
@@ -217,6 +241,33 @@ class _FakeTradingService:
                     filtered.append(row)
             rows = filtered
         return rows[:limit]
+
+
+class _ImmediateQueue:
+    def __init__(self) -> None:
+        self.tasks: list[object] = []
+
+    async def enqueue(self, task: object) -> None:
+        self.tasks.append(task)
+        callback = getattr(task, "on_success", None)
+        if callback is None:
+            return
+
+        params = getattr(task, "params", {})
+        trigger_price = float(params.get("trigger_price", params.get("new_trigger_price", 0.0)))
+        quantity = float(params.get("quantity", params.get("new_quantity", 0.0)))
+        order_type = "stop_loss" if getattr(task, "action", "") == "place_sl" else "take_profit"
+        await callback(
+            ConditionalOrderResult(
+                exchange_order_id=f"{getattr(task, 'action', 'task')}-{len(self.tasks)}",
+                client_order_id=str(params.get("client_order_id", "")),
+                order_type=order_type,
+                trigger_price=trigger_price,
+                quantity=quantity,
+                status="new",
+                is_algo=False,
+            )
+        )
 
 
 def test_auto_trade_risk_mode_accepts_decimal_ratio() -> None:
@@ -341,6 +392,39 @@ def _build_signal(
     }
 
 
+def _strategy_profile_payload() -> dict[str, object]:
+    return {
+        "sl_mode": "atr",
+        "sl_value": 2.0,
+        "tp_mode": "multi",
+        "tp_levels": [
+            {"price_offset_pct": 1.5, "close_pct": 33.3, "move_sl_to": "breakeven"},
+            {"price_offset_pct": 3.0, "close_pct": 33.3, "move_sl_to": "tp1"},
+            {"price_offset_pct": 5.0, "close_pct": 33.4, "move_sl_to": None},
+        ],
+        "trailing_enabled": True,
+        "trailing_callback_rate": 1.5,
+        "breakeven_enabled": True,
+        "breakeven_trigger_rr": 1.2,
+        "volatility_sl_enabled": True,
+        "volatility_atr_period": 14,
+        "volatility_atr_multiplier": 2.5,
+        "watchers": [
+            {
+                "indicator": "rsi",
+                "params": {"period": 14, "timeframe": "15m"},
+                "condition": "> 75",
+                "action": "tighten_sl",
+                "action_params": {"sl_offset_atr": 1.5},
+                "is_active": True,
+            }
+        ],
+        "adjustment_priority": ["watcher", "trailing", "breakeven", "volatility"],
+        "max_position_pct": 50.0,
+        "allow_sl_widen": True,
+    }
+
+
 def _build_legacy_signal(
     *,
     bias: str,
@@ -451,6 +535,278 @@ async def test_auto_trade_config_accepts_binance_account(
             ),
         )
         assert config.account_id == account_id
+
+
+async def test_auto_trade_upsert_config_persists_strategy_profile_json(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=3,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+                strategy_profile=_strategy_profile_payload(),
+            ),
+        )
+
+        assert config.strategy_profile_json is not None
+        assert config.strategy_profile_json["sl_mode"] == "atr"
+        assert config.strategy_profile_json["watchers"] == [
+            {
+                "indicator": "RSI",
+                "params": {"period": 14, "timeframe": "15m"},
+                "condition": "> 75",
+                "action": "tighten_sl",
+                "action_params": {"sl_offset_atr": 1.5},
+                "is_active": True,
+            }
+        ]
+        assert config.strategy_profile == config.strategy_profile_json
+
+
+async def test_auto_trade_upsert_config_preserves_strategy_profile_when_omitted(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        created = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=3,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+                strategy_profile=_strategy_profile_payload(),
+            ),
+        )
+        original_strategy_profile = created.strategy_profile_json
+
+        updated = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=False,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=150.0,
+                leverage=5,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+            ),
+        )
+
+        assert updated.enabled is False
+        assert updated.position_size_usdt == pytest.approx(150.0)
+        assert updated.strategy_profile_json == original_strategy_profile
+
+
+async def test_auto_trade_exchange_adapter_path_initializes_runtime_context_and_queue(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_trading = _FakeTradingService()
+    service = AutoTradeService(
+        trading_service=cast(Any, fake_trading),
+        use_exchange_adapter_entry=True,
+    )
+    queue = _ImmediateQueue()
+    fake_adapter = AsyncMock()
+    fake_adapter.place_entry_order = AsyncMock(
+        return_value=EntryOrderResult(
+            exchange_order_id="entry-1",
+            client_order_id="adapter-entry-1",
+            symbol="BTC/USDT:USDT",
+            side=ExchangeOrderSide.BUY,
+            order_type="market",
+            status="closed",
+            quantity=1.0,
+            filled_quantity=1.0,
+            remaining_quantity=0.0,
+            price=100.0,
+            average_price=100.0,
+            cost=100.0,
+            timestamp=datetime.now(UTC),
+            raw={"source": "adapter"},
+        )
+    )
+    schedule_watchers = AsyncMock(return_value="watcher-schedule-1")
+    ensure_ws_manager = AsyncMock()
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=1,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+                strategy_profile=_strategy_profile_payload(),
+            ),
+        )
+        await service.set_running(session=session, user_id=user.id, is_running=True)
+
+        monkeypatch.setattr(service, "_create_exchange_adapter", AsyncMock(return_value=fake_adapter))
+        monkeypatch.setattr("app.services.auto_trade.service.get_order_queue", AsyncMock(return_value=queue))
+        monkeypatch.setattr(service, "_schedule_position_watchers", schedule_watchers)
+        monkeypatch.setattr(service, "_ensure_ws_manager_tracked", ensure_ws_manager)
+
+        async def _persist_runtime(position_context: PositionContext) -> None:
+            row = await session.get(AutoTradePosition, int(position_context.position_id))
+            assert row is not None
+            service._merge_position_context_into_row(row=row, position=position_context)
+            await session.flush()
+
+        monkeypatch.setattr(service, "_persist_runtime_position", _persist_runtime)
+
+        history = await _create_history(
+            session,
+            user_id=user.id,
+            profile_id=profile.id,
+            trade_job_id="job-adapter-open",
+            signal_payload=_build_signal(trend="LONG", confidence_pct=70.0),
+        )
+        await service.enqueue_history_signal(session=session, history=history)
+        stats = await service.process_signal_queue(session=session)
+        assert stats["completed"] == 1
+
+        fake_adapter.place_entry_order.assert_awaited_once()
+        assert fake_trading.order_calls == []
+        assert fake_trading.leverage_calls == [("BTC/USDT:USDT", 1)]
+        schedule_watchers.assert_awaited_once()
+        ensure_ws_manager.assert_awaited_once()
+
+        position = cast(
+            AutoTradePosition | None,
+            await session.scalar(
+                select(AutoTradePosition)
+                .where(AutoTradePosition.user_id == user.id)
+                .order_by(AutoTradePosition.id.desc())
+                .limit(1)
+            ),
+        )
+        assert position is not None
+        assert position.status == "open"
+        assert position.state == "open"
+        assert position.sl_type == "atr"
+        assert position.tp_mode == "multi"
+        assert float(position.original_quantity or 0) == pytest.approx(1.0)
+        assert float(position.current_quantity or 0) == pytest.approx(1.0)
+        assert position.sl_exchange_order_id == "place_sl-1"
+        assert position.active_watchers_json[0]["indicator"] == "RSI"
+        assert [task.action for task in queue.tasks] == [
+            "place_sl",
+            "place_tp",
+            "place_tp",
+            "place_tp",
+        ]
+        assert queue.tasks[0].params["trigger_price"] == pytest.approx(99.0)
+        assert len(position.tp_levels_json) == 3
+        assert [level["exchange_order_id"] for level in position.tp_levels_json] == [
+            "place_tp-2",
+            "place_tp-3",
+            "place_tp-4",
+        ]
+        assert all(level["status"] == "open" for level in position.tp_levels_json)
+        assert [entry["trigger"] for entry in position.transition_log_json] == [
+            "entry_submitted",
+            "entry_filled",
+        ]
+
+
+async def test_ensure_ws_manager_reuses_single_account_manager(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_trading = _FakeTradingService()
+    service = AutoTradeService(
+        trading_service=cast(Any, fake_trading),
+        use_exchange_adapter_entry=True,
+    )
+    fake_adapter = AsyncMock()
+    monkeypatch.setattr(service, "_create_exchange_adapter", AsyncMock(return_value=fake_adapter))
+
+    created_managers: list[object] = []
+
+    class _FakeManager:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.started = 0
+            self.tracked: list[str] = []
+            created_managers.append(self)
+
+        async def start(self) -> None:
+            self.started += 1
+
+        def track_position(self, position: PositionContext) -> None:
+            self.tracked.append(position.position_id)
+
+    monkeypatch.setattr("app.services.auto_trade.service.WebSocketManager", _FakeManager)
+    auto_trade_service_module._WS_MANAGER_REGISTRY.clear()
+
+    async with auto_trade_db() as session:
+        first = PositionContext(
+            position_id="1",
+            user_id="10",
+            account_id="42",
+            exchange="binance",
+            symbol="BTC/USDT:USDT",
+            state=PositionState.OPEN,
+        )
+        second = PositionContext(
+            position_id="2",
+            user_id="10",
+            account_id="42",
+            exchange="binance",
+            symbol="ETH/USDT:USDT",
+            state=PositionState.OPEN,
+        )
+
+        await service._ensure_ws_manager_tracked(session=session, position=first)
+        await service._ensure_ws_manager_tracked(session=session, position=second)
+
+    assert len(created_managers) == 1
+    manager = cast(Any, created_managers[0])
+    assert manager.started == 1
+    assert manager.tracked == ["1", "2"]
+    auto_trade_service_module._WS_MANAGER_REGISTRY.clear()
 
 
 async def test_auto_trade_opens_and_closes_after_two_opposite_reports(
@@ -1538,3 +1894,359 @@ async def test_auto_trade_client_order_id_includes_config_scope(
         assert len(open_client_order_ids) == 2
         for config_id in config_ids:
             assert any(f"-{config_id}-" in order_id for order_id in open_client_order_ids)
+
+
+# ─── Bracket TP/SL on entry ───────────────────────────────────────────────────
+
+
+def _build_entry_result(
+    *,
+    side: ExchangeOrderSide,
+    quantity: float = 1.0,
+    attached_sl: ConditionalOrderResult | None = None,
+    attached_tp: ConditionalOrderResult | None = None,
+) -> EntryOrderResult:
+    return EntryOrderResult(
+        exchange_order_id="entry-1",
+        client_order_id="adapter-entry-1",
+        symbol="BTC/USDT:USDT",
+        side=side,
+        order_type="market",
+        status="closed",
+        quantity=quantity,
+        filled_quantity=quantity,
+        remaining_quantity=0.0,
+        price=100.0,
+        average_price=100.0,
+        cost=100.0 * quantity,
+        timestamp=datetime.now(UTC),
+        raw={"source": "adapter"},
+        attached_sl=attached_sl,
+        attached_tp=attached_tp,
+    )
+
+
+def _bracket_conditional_result(
+    *,
+    order_type: str,
+    trigger_price: float,
+    quantity: float = 1.0,
+) -> ConditionalOrderResult:
+    return ConditionalOrderResult(
+        exchange_order_id=f"bracket-{order_type}-1",
+        client_order_id=f"adapter-entry-1-{order_type[:2]}",
+        order_type=order_type,
+        trigger_price=trigger_price,
+        quantity=quantity,
+        status="new",
+        is_algo=False,
+    )
+
+
+async def test_signal_open_with_bracket_attaches_protective_orders_legacy(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """Legacy CCXT path must forward computed tp_price/sl_price to the trading service."""
+    fake_trading = _FakeTradingService()
+    service = AutoTradeService(trading_service=cast(Any, fake_trading))
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=1,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+            ),
+        )
+        await service.set_running(session=session, user_id=user.id, is_running=True)
+
+        history = await _create_history(
+            session,
+            user_id=user.id,
+            profile_id=profile.id,
+            trade_job_id="job-bracket-legacy",
+            signal_payload=_build_signal(trend="LONG", confidence_pct=70.0),
+        )
+        await service.enqueue_history_signal(session=session, history=history)
+        stats = await service.process_signal_queue(session=session)
+        assert stats["completed"] == 1
+
+        entry_calls = [c for c in fake_trading.order_calls if c.get("reduce_only") is False]
+        assert len(entry_calls) == 1
+        opened = entry_calls[0]
+        assert opened["take_profit_price"] == pytest.approx(102.0)
+        assert opened["stop_loss_price"] == pytest.approx(99.0)
+
+
+async def test_signal_open_with_bracket_skips_queue_enqueue_for_single_tp(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adapter path: when bracket attaches both SL and TP, queue must not duplicate them."""
+    fake_trading = _FakeTradingService()
+    service = AutoTradeService(
+        trading_service=cast(Any, fake_trading),
+        use_exchange_adapter_entry=True,
+    )
+    queue = _ImmediateQueue()
+    fake_adapter = AsyncMock()
+    fake_adapter.place_entry_order = AsyncMock(
+        return_value=_build_entry_result(
+            side=ExchangeOrderSide.BUY,
+            attached_sl=_bracket_conditional_result(
+                order_type="stop_loss", trigger_price=99.0
+            ),
+            attached_tp=_bracket_conditional_result(
+                order_type="take_profit", trigger_price=102.0
+            ),
+        )
+    )
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=1,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+            ),
+        )
+        await service.set_running(session=session, user_id=user.id, is_running=True)
+
+        monkeypatch.setattr(
+            service, "_create_exchange_adapter", AsyncMock(return_value=fake_adapter)
+        )
+        monkeypatch.setattr(
+            "app.services.auto_trade.service.get_order_queue",
+            AsyncMock(return_value=queue),
+        )
+        monkeypatch.setattr(service, "_schedule_position_watchers", AsyncMock())
+        monkeypatch.setattr(service, "_ensure_ws_manager_tracked", AsyncMock())
+
+        async def _persist_runtime(position_context: PositionContext) -> None:
+            row = await session.get(AutoTradePosition, int(position_context.position_id))
+            assert row is not None
+            service._merge_position_context_into_row(row=row, position=position_context)
+            await session.flush()
+
+        monkeypatch.setattr(service, "_persist_runtime_position", _persist_runtime)
+
+        history = await _create_history(
+            session,
+            user_id=user.id,
+            profile_id=profile.id,
+            trade_job_id="job-bracket-adapter",
+            signal_payload=_build_signal(trend="LONG", confidence_pct=70.0),
+        )
+        await service.enqueue_history_signal(session=session, history=history)
+        stats = await service.process_signal_queue(session=session)
+        assert stats["completed"] == 1
+
+        kwargs = fake_adapter.place_entry_order.await_args.kwargs
+        assert kwargs["take_profit_price"] == pytest.approx(102.0)
+        assert kwargs["stop_loss_price"] == pytest.approx(99.0)
+        assert kwargs["sl_client_order_id"] is not None
+        assert kwargs["tp_client_order_id"] is not None
+        # Bracket succeeded -> queue must remain empty for single-TP profile.
+        assert queue.tasks == []
+
+        position = cast(
+            AutoTradePosition | None,
+            await session.scalar(
+                select(AutoTradePosition)
+                .where(AutoTradePosition.user_id == user.id)
+                .order_by(AutoTradePosition.id.desc())
+                .limit(1)
+            ),
+        )
+        assert position is not None
+        assert position.status == "open"
+        assert position.sl_exchange_order_id == "bracket-stop_loss-1"
+
+
+async def test_signal_open_emergency_closes_when_bracket_sl_fails(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If bracket SL placement raises, the position must be flattened and not recorded as open."""
+    fake_trading = _FakeTradingService()
+    service = AutoTradeService(trading_service=cast(Any, fake_trading))
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=1,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+            ),
+        )
+        await service.set_running(session=session, user_id=user.id, is_running=True)
+
+        # Simulate the legacy entry call raising as if bracket SL was rejected by the exchange
+        # post-fill. The trading service signals failure via `place_futures_market_order`.
+        original = fake_trading.place_futures_market_order
+        call_count = {"n": 0}
+
+        async def _failing_open(**kwargs: Any) -> SpotOrderRead:
+            if kwargs.get("reduce_only") is False:
+                call_count["n"] += 1
+                raise ExchangeServiceError(
+                    code="bracket_rejected",
+                    message="Stop-loss attach failed.",
+                    retryable=False,
+                )
+            return await original(**kwargs)
+
+        monkeypatch.setattr(fake_trading, "place_futures_market_order", _failing_open)
+
+        history = await _create_history(
+            session,
+            user_id=user.id,
+            profile_id=profile.id,
+            trade_job_id="job-bracket-fail",
+            signal_payload=_build_signal(trend="LONG", confidence_pct=70.0),
+        )
+        await service.enqueue_history_signal(session=session, history=history)
+        stats = await service.process_signal_queue(session=session)
+
+        # The signal failed in entry placement and was retried/dead-lettered, never opened.
+        assert stats["completed"] == 0
+        assert call_count["n"] >= 1
+
+        positions = list(
+            (
+                await session.scalars(
+                    select(AutoTradePosition).where(AutoTradePosition.user_id == user.id)
+                )
+            ).all()
+        )
+        assert positions == []
+
+
+async def test_signal_open_multi_tp_uses_bracket_sl_and_queue_for_tps(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-TP profile: bracket attaches SL only; multi-TP queue still drives TPs."""
+    fake_trading = _FakeTradingService()
+    service = AutoTradeService(
+        trading_service=cast(Any, fake_trading),
+        use_exchange_adapter_entry=True,
+    )
+    queue = _ImmediateQueue()
+    fake_adapter = AsyncMock()
+    fake_adapter.place_entry_order = AsyncMock(
+        return_value=_build_entry_result(
+            side=ExchangeOrderSide.BUY,
+            attached_sl=_bracket_conditional_result(
+                order_type="stop_loss", trigger_price=99.0
+            ),
+        )
+    )
+
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=1,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+                strategy_profile=_strategy_profile_payload(),
+            ),
+        )
+        await service.set_running(session=session, user_id=user.id, is_running=True)
+
+        monkeypatch.setattr(
+            service, "_create_exchange_adapter", AsyncMock(return_value=fake_adapter)
+        )
+        monkeypatch.setattr(
+            "app.services.auto_trade.service.get_order_queue",
+            AsyncMock(return_value=queue),
+        )
+        monkeypatch.setattr(service, "_schedule_position_watchers", AsyncMock())
+        monkeypatch.setattr(service, "_ensure_ws_manager_tracked", AsyncMock())
+
+        async def _persist_runtime(position_context: PositionContext) -> None:
+            row = await session.get(AutoTradePosition, int(position_context.position_id))
+            assert row is not None
+            service._merge_position_context_into_row(row=row, position=position_context)
+            await session.flush()
+
+        monkeypatch.setattr(service, "_persist_runtime_position", _persist_runtime)
+
+        history = await _create_history(
+            session,
+            user_id=user.id,
+            profile_id=profile.id,
+            trade_job_id="job-bracket-multi",
+            signal_payload=_build_signal(trend="LONG", confidence_pct=70.0),
+        )
+        await service.enqueue_history_signal(session=session, history=history)
+        stats = await service.process_signal_queue(session=session)
+        assert stats["completed"] == 1
+
+        kwargs = fake_adapter.place_entry_order.await_args.kwargs
+        # Multi-TP routes TP placements through the queue, so bracket only attaches SL.
+        assert kwargs["take_profit_price"] is None
+        assert kwargs["stop_loss_price"] == pytest.approx(99.0)
+
+        # Queue receives the 3 multi-TP placements but no place_sl (bracket already covered SL).
+        assert [getattr(t, "action", "") for t in queue.tasks] == [
+            "place_tp",
+            "place_tp",
+            "place_tp",
+        ]
+
+        position = cast(
+            AutoTradePosition | None,
+            await session.scalar(
+                select(AutoTradePosition)
+                .where(AutoTradePosition.user_id == user.id)
+                .order_by(AutoTradePosition.id.desc())
+                .limit(1)
+            ),
+        )
+        assert position is not None
+        assert position.sl_exchange_order_id == "bracket-stop_loss-1"

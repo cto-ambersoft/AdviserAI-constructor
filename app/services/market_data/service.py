@@ -1,6 +1,6 @@
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 from redis.asyncio import Redis
@@ -20,10 +20,16 @@ class MarketDataService:
         symbol: str,
         timeframe: str,
         bars: int,
+        market_type: Literal["spot", "futures"] = "spot",
         cache_ttl_seconds: int = 60,
+        start_time: str | None = None,
+        end_time: str | None = None,
     ) -> pd.DataFrame:
         normalized_exchange = normalize_exchange_name(exchange_name)
-        cache_key = f"ohlcv:{normalized_exchange}:{symbol}:{timeframe}:{bars}"
+        cache_key = (
+            f"ohlcv:{normalized_exchange}:{market_type}:{symbol}:{timeframe}:{bars}:"
+            f"{start_time or ''}:{end_time or ''}"
+        )
         cached = await self._get_cached(cache_key)
         if cached is not None:
             return cached
@@ -36,7 +42,14 @@ class MarketDataService:
                 mode="real",
             )
         )
-        raw = await adapter.fetch_ohlcv(symbol=symbol, timeframe=timeframe, bars=bars)
+        raw = await adapter.fetch_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            bars=bars,
+            market_type=market_type,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
         df = self._to_frame(raw)
         await self._set_cached(cache_key, df, cache_ttl_seconds)

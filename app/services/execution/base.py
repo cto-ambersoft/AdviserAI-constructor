@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.schemas.exchange_trading import (
     AttachedTriggerOrder,
@@ -123,5 +123,12 @@ class CexAdapter(Protocol):
     ) -> NormalizedFuturesPosition | None: ...
 
     async def fetch_ohlcv(
-        self, *, symbol: str, timeframe: str, bars: int
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        bars: int,
+        market_type: Literal["spot", "futures"] = "spot",
+        start_time: str | None = None,
+        end_time: str | None = None,
     ) -> list[list[object]]: ...

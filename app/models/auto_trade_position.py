@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
@@ -8,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     text,
 )
@@ -38,6 +40,14 @@ class AutoTradePosition(Base, TimestampMixin):
             unique=True,
             postgresql_where=text("status = 'open'"),
             sqlite_where=text("status = 'open'"),
+        ),
+        Index(
+            "ix_positions_user_state",
+            "user_id",
+            "state",
+            unique=False,
+            postgresql_where=text("state NOT IN ('closed', 'cancelled', 'failed')"),
+            sqlite_where=text("state NOT IN ('closed', 'cancelled', 'failed')"),
         ),
     )
 
@@ -86,3 +96,47 @@ class AutoTradePosition(Base, TimestampMixin):
     )
     raw_open_order: Mapped[dict[str, object]] = mapped_column(JSON(), nullable=False, default=dict)
     raw_close_order: Mapped[dict[str, object]] = mapped_column(JSON(), nullable=False, default=dict)
+
+    state: Mapped[str] = mapped_column(String(30), nullable=False, default="open")
+    original_quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    current_quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    sl_type: Mapped[str] = mapped_column(String(20), nullable=False, default="fixed")
+    sl_exchange_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    sl_history_json: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON(),
+        nullable=False,
+        default=list,
+    )
+    tp_mode: Mapped[str] = mapped_column(String(10), nullable=False, default="single")
+    tp_levels_json: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON(),
+        nullable=False,
+        default=list,
+    )
+    tp_history_json: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON(),
+        nullable=False,
+        default=list,
+    )
+    trailing_config_json: Mapped[dict[str, object] | None] = mapped_column(JSON(), nullable=True)
+    breakeven_config_json: Mapped[dict[str, object] | None] = mapped_column(JSON(), nullable=True)
+    volatility_config_json: Mapped[dict[str, object] | None] = mapped_column(
+        JSON(),
+        nullable=True,
+    )
+    active_watchers_json: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON(),
+        nullable=False,
+        default=list,
+    )
+    adjustment_priority_json: Mapped[list[str]] = mapped_column(
+        JSON(),
+        nullable=False,
+        default=lambda: ["watcher", "trailing", "breakeven", "volatility"],
+    )
+    transition_log_json: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON(),
+        nullable=False,
+        default=list,
+    )
+    last_adjusted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

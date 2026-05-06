@@ -3,7 +3,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.services.backtesting.common import add_capital_metrics, annotate_trade_confirmations
+from app.services.backtesting.common import (
+    add_capital_metrics,
+    annotate_trade_confirmations,
+    build_r_chart_points,
+)
 
 
 def _calc_ema(series: pd.Series, period: int) -> pd.Series:
@@ -156,7 +160,10 @@ def run_atr_order_block(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, A
         summary=summary,
         trades=trades,
         initial_balance=allocation_usdt,
+        period_start=df.index[0] if len(df.index) else None,
+        period_end=df.index[-1] if len(df.index) else None,
     )
+    r_chart_points = build_r_chart_points(trades)
     return {
         "summary": summary,
         "trades": trades,
@@ -164,6 +171,7 @@ def run_atr_order_block(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, A
             "ohlcv": work.reset_index().to_dict(orient="records"),
             "ema": work["EMA"].tolist(),
             "equity_curve": equity_curve,
+            **r_chart_points,
         },
         "explanations": [],
     }

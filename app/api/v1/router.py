@@ -3,13 +3,16 @@ from fastapi import APIRouter, Depends
 from app.api.deps import get_current_user
 from app.api.v1.endpoints import (
     accounts,
+    admin,
     ai,
+    ai_backtests,
     analysis,
     audit,
     auth,
     backtest,
     exchange,
     health,
+    internal_backtest,
     live,
     market,
     personal_analysis,
@@ -19,6 +22,7 @@ from app.api.v1.endpoints import (
 api_router = APIRouter()
 api_router.include_router(health.router, tags=["health"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(internal_backtest.router, prefix="/internal", tags=["internal"])
 
 protected_router = APIRouter(dependencies=[Depends(get_current_user)])
 protected_router.include_router(strategies.router, prefix="/strategies", tags=["strategies"])
@@ -29,6 +33,12 @@ protected_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 protected_router.include_router(market.router, prefix="/market", tags=["market"])
 protected_router.include_router(accounts.router, prefix="/accounts", tags=["accounts"])
 protected_router.include_router(live.router, prefix="/live", tags=["live"])
+protected_router.include_router(admin.router, prefix="/admin", tags=["admin"])
+protected_router.include_router(
+    ai_backtests.router,
+    prefix="/ai-backtests",
+    tags=["ai-backtests"],
+)
 protected_router.include_router(analysis.router, prefix="/analysis", tags=["analysis"])
 protected_router.include_router(
     personal_analysis.router,

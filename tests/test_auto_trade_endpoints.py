@@ -277,6 +277,39 @@ async def _seed_open_auto_trade_position(
         return position.id
 
 
+def _strategy_profile_payload() -> dict[str, object]:
+    return {
+        "sl_mode": "atr",
+        "sl_value": 2.0,
+        "tp_mode": "multi",
+        "tp_levels": [
+            {"price_offset_pct": 1.5, "close_pct": 33.3, "move_sl_to": "breakeven"},
+            {"price_offset_pct": 3.0, "close_pct": 33.3, "move_sl_to": "tp1"},
+            {"price_offset_pct": 5.0, "close_pct": 33.4, "move_sl_to": None},
+        ],
+        "trailing_enabled": True,
+        "trailing_callback_rate": 1.5,
+        "breakeven_enabled": True,
+        "breakeven_trigger_rr": 1.2,
+        "volatility_sl_enabled": True,
+        "volatility_atr_period": 14,
+        "volatility_atr_multiplier": 2.5,
+        "watchers": [
+            {
+                "indicator": "rsi",
+                "params": {"period": 14, "timeframe": "15m"},
+                "condition": "> 75",
+                "action": "tighten_sl",
+                "action_params": {"sl_offset_atr": 1.5},
+                "is_active": True,
+            }
+        ],
+        "adjustment_priority": ["watcher", "trailing", "breakeven", "volatility"],
+        "max_position_pct": 50.0,
+        "allow_sl_widen": True,
+    }
+
+
 async def test_auto_trade_config_play_state_and_events_endpoints(
     auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -341,6 +374,92 @@ async def test_auto_trade_config_play_state_and_events_endpoints(
         event_types = {item["event_type"] for item in events.json()["events"]}
         assert "config_created" in event_types or "config_updated" in event_types
         assert "auto_trade_play" in event_types
+
+
+async def test_auto_trade_config_endpoint_round_trips_strategy_profile(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    strategy_profile = _strategy_profile_payload()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+                "strategy_profile": strategy_profile,
+            },
+        )
+        assert created.status_code == 200
+        created_body = created.json()
+        assert created_body["strategy_profile"] is not None
+        assert created_body["strategy_profile"]["sl_mode"] == "atr"
+        assert created_body["strategy_profile"]["watchers"][0]["indicator"] == "RSI"
+        assert created_body["strategy_profile"]["tp_levels"][1]["move_sl_to"] == "tp1"
+
+        fetched = await client.get("/api/v1/live/auto-trade/config")
+        assert fetched.status_code == 200
+        fetched_body = fetched.json()
+        assert fetched_body["strategy_profile"] == created_body["strategy_profile"]
+
+
+async def test_auto_trade_config_endpoint_preserves_strategy_profile_when_omitted(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+                "strategy_profile": _strategy_profile_payload(),
+            },
+        )
+        assert created.status_code == 200
+        original_strategy_profile = created.json()["strategy_profile"]
+
+        updated = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": False,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 150.0,
+                "leverage": 2,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+            },
+        )
+        assert updated.status_code == 200
+        updated_body = updated.json()
+        assert updated_body["enabled"] is False
+        assert updated_body["position_size_usdt"] == 150.0
+        assert updated_body["strategy_profile"] == original_strategy_profile
 
 
 async def test_auto_trade_positions_endpoint_returns_empty_summary() -> None:

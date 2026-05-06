@@ -2,13 +2,16 @@ import logging
 
 from app.db.session import AsyncSessionFactory
 from app.services.auto_trade.service import AutoTradeService
+from app.services.auto_trade.trade_sync import ExchangeTradeSyncService
 from app.services.backtesting.service import BacktestingService
 from app.services.personal_analysis.service import PersonalAnalysisService
+from app.services.watchers.service import run_position_watcher_tick
 from app.worker.broker import broker
 
 service = BacktestingService()
 personal_analysis_service = PersonalAnalysisService()
 auto_trade_service = AutoTradeService()
+trade_sync_service = ExchangeTradeSyncService()
 logger = logging.getLogger(__name__)
 
 
@@ -93,3 +96,28 @@ async def process_auto_trade_signal_queue() -> dict[str, int]:
         )
     return stats
 
+
+@broker.task(
+    task_name="app.worker.tasks.sync_auto_trade_exchange_trades",
+    schedule=[{"cron": "* * * * *", "schedule_id": "auto_trade_trade_sync_every_minute"}],
+)
+async def sync_auto_trade_exchange_trades() -> dict[str, int]:
+    async with AsyncSessionFactory() as session:
+        stats = await trade_sync_service.sync_running_configs(session=session)
+    if _stats_has_non_zero(stats, keys=("configs", "synced", "inserted_or_updated", "errors")):
+        logger.info(
+            (
+                "auto_trade_trade_sync summary: configs=%s synced=%s "
+                "inserted_or_updated=%s errors=%s"
+            ),
+            stats.get("configs", 0),
+            stats.get("synced", 0),
+            stats.get("inserted_or_updated", 0),
+            stats.get("errors", 0),
+        )
+    return stats
+
+
+@broker.task(task_name="position_watcher_tick")
+async def position_watcher_tick(position_id: str) -> dict[str, object]:
+    return await run_position_watcher_tick(position_id)

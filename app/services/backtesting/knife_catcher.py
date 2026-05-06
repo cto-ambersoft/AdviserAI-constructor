@@ -2,7 +2,11 @@ from typing import Any
 
 import pandas as pd
 
-from app.services.backtesting.common import add_capital_metrics, annotate_trade_confirmations
+from app.services.backtesting.common import (
+    add_capital_metrics,
+    annotate_trade_confirmations,
+    build_r_chart_points,
+)
 
 
 def _range_pct(open_price: float, high: float, low: float) -> float:
@@ -211,24 +215,37 @@ def run_knife_catcher(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any
     else:
         trades_df = trades_df.copy()
         trades_df["pnl_usdt"] = trades_df["pnl_pct"].astype(float) * account_balance
+        trades_df["allocation_usdt"] = account_balance
+        trades_df["risk_usdt"] = (
+            (trades_df["entry"].astype(float) - trades_df["sl"].astype(float)).abs()
+            / trades_df["entry"].astype(float)
+            * account_balance
+        )
         summary = {
             "total_trades": int(len(trades_df)),
             "win_rate": float((trades_df["pnl_pct"] > 0).mean() * 100),
             "total_return_pct": float(trades_df["pnl_pct"].sum() * 100),
             "total_pnl_usdt": float(trades_df["pnl_usdt"].sum()),
         }
-    trades = annotate_trade_confirmations(trades_df.to_dict(orient="records"))
+    raw_trades = trades_df.to_dict(orient="records")
+    trades = annotate_trade_confirmations(
+        [{str(key): value for key, value in row.items()} for row in raw_trades]
+    )
     summary, equity_curve = add_capital_metrics(
         summary=summary,
         trades=trades,
         initial_balance=account_balance,
+        period_start=df.index[0] if len(df.index) else None,
+        period_end=df.index[-1] if len(df.index) else None,
     )
+    r_chart_points = build_r_chart_points(trades)
     return {
         "summary": summary,
         "trades": trades,
         "chart_points": {
             "ohlcv": df.reset_index().to_dict(orient="records"),
             "equity_curve": equity_curve,
+            **r_chart_points,
         },
         "explanations": [],
     }

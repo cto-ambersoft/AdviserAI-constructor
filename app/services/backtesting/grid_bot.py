@@ -3,7 +3,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.services.backtesting.common import add_capital_metrics, annotate_trade_confirmations
+from app.services.backtesting.common import (
+    add_capital_metrics,
+    annotate_trade_confirmations,
+    build_r_chart_points,
+)
 
 
 def grid_bot_backtest(
@@ -61,6 +65,8 @@ def grid_bot_backtest(
                         "entry": float(pos["entry"]),
                         "exit": take_price,
                         "qty": qty,
+                        "allocation_usdt": per_order_usdt,
+                        "risk_usdt": per_order_usdt,
                         "pnl_usdt": pnl,
                         "pnl_pct": pnl / initial_capital_usdt
                         if initial_capital_usdt > 0
@@ -92,6 +98,8 @@ def grid_bot_backtest(
                     "entry": entry,
                     "exit": last_close,
                     "qty": qty,
+                    "allocation_usdt": per_order_usdt,
+                    "risk_usdt": per_order_usdt,
                     "pnl_usdt": pnl,
                     "pnl_pct": pnl / initial_capital_usdt if initial_capital_usdt > 0 else np.nan,
                     "exit_reason": "EOD_CLOSE",
@@ -126,18 +134,25 @@ def run_grid_bot(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
             "win_rate": float((trades_df["pnl_usdt"] > 0).mean() * 100),
             "total_pnl_usdt": float(trades_df["pnl_usdt"].sum()),
         }
-    trades = annotate_trade_confirmations(trades_df.to_dict(orient="records"))
+    raw_trades = trades_df.to_dict(orient="records")
+    trades = annotate_trade_confirmations(
+        [{str(key): value for key, value in row.items()} for row in raw_trades]
+    )
     summary, equity_curve = add_capital_metrics(
         summary=summary,
         trades=trades,
         initial_balance=initial_capital_usdt,
+        period_start=df.index[0] if len(df.index) else None,
+        period_end=df.index[-1] if len(df.index) else None,
     )
+    r_chart_points = build_r_chart_points(trades)
     return {
         "summary": summary,
         "trades": trades,
         "chart_points": {
             "ohlcv": df.reset_index().to_dict(orient="records"),
             "equity_curve": equity_curve,
+            **r_chart_points,
         },
         "explanations": [],
     }

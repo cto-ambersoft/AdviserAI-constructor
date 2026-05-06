@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.api.deps import get_current_user
 from app.api.v1.endpoints import backtest as backtest_endpoint
+from app.core.config import get_settings
 from app.db.session import get_db_session
 from app.main import app
 from app.models.base import Base
@@ -74,6 +76,20 @@ def _candles(count: int = 140) -> list[dict[str, float | str]]:
     return rows
 
 
+def _write_ai_forecast_csv(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "signal_time_utc,predicted_trend,confidence_bull,confidence_bear,confidence_flat",
+                "2025-01-01T00:00:00+00:00,bull,85.0,20.0,10.0",
+                "2025-01-02T00:00:00+00:00,bear,35.0,90.0,15.0",
+                "2025-01-03T00:00:00+00:00,flat,45.0,45.0,85.0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 async def test_vwap_backtest_endpoint_returns_contract_shape() -> None:
     payload = {
         "symbol": "BTC/USDT",
@@ -91,7 +107,407 @@ async def test_vwap_backtest_endpoint_returns_contract_shape() -> None:
     assert response.status_code == 200
     body = response.json()
     assert set(body.keys()) == {"summary", "trades", "chart_points", "explanations"}
+    assert "r_squared" in body["summary"]
+    assert "r_cumulative" in body["summary"]
+    assert "avg_r" in body["summary"]
+    assert "total_r" in body["summary"]
     assert body["chart_points"] == {}
+
+
+async def test_ai_forecast_files_endpoint_returns_sorted_csv_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exports_dir = tmp_path / "exports"
+    exports_dir.mkdir()
+    (exports_dir / "zeta.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (exports_dir / "alpha.csv").write_text("a,b\n3,4\n", encoding="utf-8")
+    (exports_dir / "ignore.txt").write_text("ignored", encoding="utf-8")
+    monkeypatch.setattr(backtest_endpoint.service, "_exports_dir", exports_dir)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/v1/backtest/ai-forecast-files")
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["file_name"] for item in body["files"]] == ["alpha.csv", "zeta.csv"]
+    assert all("modified_at_utc" in item for item in body["files"])
+
+
+async def test_ai_forecast_files_endpoint_uses_configured_exports_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exports_dir = tmp_path / "custom-exports"
+    exports_dir.mkdir()
+    (exports_dir / "forecast.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+
+    monkeypatch.setenv("AI_FORECAST_EXPORTS_DIR", str(exports_dir))
+    get_settings.cache_clear()
+    try:
+        fresh_service = BacktestingService()
+        monkeypatch.setattr(backtest_endpoint, "service", fresh_service)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/v1/backtest/ai-forecast-files")
+        assert response.status_code == 200
+        assert response.json()["files"][0]["file_name"] == "forecast.csv"
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_vwap_backtest_with_ai_returns_baseline_and_ai_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exports_dir = tmp_path / "exports"
+    exports_dir.mkdir()
+    csv_path = exports_dir / "forecast.csv"
+    _write_ai_forecast_csv(csv_path)
+    monkeypatch.setattr(backtest_endpoint.service, "_exports_dir", exports_dir)
+
+    payload = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 180,
+        "candles": _candles(180),
+        "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+        "regime": "Flat",
+        "run_with_ai": True,
+        "ai_forecast_file": "forecast.csv",
+        "ai_bull_confidence_threshold": 70.0,
+        "ai_bear_confidence_threshold": 70.0,
+        "include_series": False,
+        "trades_limit": 100,
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/backtest/vwap", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"result", "baseline", "comparison"}
+    assert set(body["comparison"].keys()) == {
+        "total_pnl_delta",
+        "win_rate_delta",
+        "trades_delta",
+        "profit_factor_delta",
+        "sharpe_proxy_delta",
+        "max_drawdown_delta",
+        "calmar_ratio_delta",
+    }
+    assert set(body["result"].keys()) == {"summary", "trades", "chart_points", "explanations"}
+    assert set(body["baseline"].keys()) == {"summary", "trades", "chart_points", "explanations"}
+    assert "r_squared" in body["result"]["summary"]
+    assert "r_cumulative" in body["result"]["summary"]
+    assert "calmar_ratio" in body["result"]["summary"]
+    assert "r_squared" in body["baseline"]["summary"]
+    assert "r_cumulative" in body["baseline"]["summary"]
+    assert "calmar_ratio" in body["baseline"]["summary"]
+    assert body["baseline"]["chart_points"] == {}
+    assert body["result"]["chart_points"] == {}
+    assert body["comparison"]["trades_delta"] == (
+        int(body["result"]["summary"].get("total_trades", 0))
+        - int(body["baseline"]["summary"].get("total_trades", 0))
+    )
+
+
+async def test_vwap_backtest_with_ai_accepts_null_thresholds_with_runtime_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exports_dir = tmp_path / "exports"
+    exports_dir.mkdir()
+    csv_path = exports_dir / "forecast.csv"
+    _write_ai_forecast_csv(csv_path)
+    monkeypatch.setattr(backtest_endpoint.service, "_exports_dir", exports_dir)
+
+    payload = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 180,
+        "candles": _candles(180),
+        "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+        "regime": "Flat",
+        "run_with_ai": True,
+        "ai_forecast_file": "forecast.csv",
+        "ai_bull_confidence_threshold": None,
+        "ai_bear_confidence_threshold": None,
+        "include_series": False,
+        "trades_limit": 100,
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/backtest/vwap", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"result", "baseline", "comparison"}
+
+
+async def test_vwap_with_ai_baseline_matches_plain_run_and_keeps_user_candles() -> None:
+    service = BacktestingService()
+    candles = _candles(160)
+    payload = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 160,
+        "candles": candles,
+        "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+        "regime": "Flat",
+        "include_series": True,
+    }
+    plain = await service.run_vwap({**payload, "run_with_ai": False})
+    comparison = await service.run_vwap_with_ai_rows(
+        {
+            **payload,
+            "run_with_ai": True,
+            "ai_forecast_rows": [
+                {
+                    "signal_time_utc": "2025-03-01T00:00:00+00:00",
+                    "horizon_end_utc": "2025-03-02T00:00:00+00:00",
+                    "predicted_trend": "bull",
+                    "confidence_bull": 90.0,
+                    "confidence_bear": 5.0,
+                    "confidence_flat": 5.0,
+                }
+            ],
+        }
+    )
+
+    trade_keys = (
+        "side",
+        "entry_i",
+        "exit_i",
+        "entry_time",
+        "exit_time",
+        "entry",
+        "sl",
+        "tp",
+        "exit",
+        "exit_reason",
+        "pnl_usdt",
+        "pnl_pct",
+        "regime",
+    )
+    assert comparison["baseline"]["summary"] == plain["summary"]
+    assert [
+        {key: trade.get(key) for key in trade_keys}
+        for trade in comparison["baseline"]["trades"]
+    ] == [{key: trade.get(key) for key in trade_keys} for trade in plain["trades"]]
+    result_chart = comparison["ai_forecast"]["chart_points"]
+    assert len(result_chart["ohlcv"]) == len(candles)
+    assert len(result_chart["ai_forecast_overlay"]) == len(candles)
+    assert all(point["applied"] is False for point in result_chart["ai_forecast_overlay"])
+    assert (
+        pd.to_datetime(result_chart["ohlcv"][0]["time"], utc=True).isoformat()
+        == candles[0]["time"]
+    )
+    assert (
+        pd.to_datetime(result_chart["ohlcv"][-1]["time"], utc=True).isoformat()
+        == candles[-1]["time"]
+    )
+
+
+async def test_ai_backtest_keeps_requested_market_window() -> None:
+    service = BacktestingService()
+    captured: dict[str, object] = {}
+
+    async def _fake_load_market_frame(**kwargs: object) -> pd.DataFrame:
+        captured.update(kwargs)
+        frame = pd.DataFrame(_candles(120))
+        frame["time"] = pd.to_datetime(frame["time"], utc=True)
+        return frame.set_index("time")[["open", "high", "low", "close", "volume"]].astype(float)
+
+    service.load_market_frame = _fake_load_market_frame
+    await service._load_market_frame_from_payload(
+        {
+            "symbol": "BTC/USDT",
+            "timeframe": "1h",
+            "bars": 120,
+            "start_time": "2025-01-01T00:00:00+00:00",
+            "end_time": "2025-01-06T00:00:00+00:00",
+            "run_with_ai": True,
+            "ai_forecast_rows": [
+                {
+                    "signal_time_utc": "2025-03-01T01:00:00+00:00",
+                    "horizon_end_utc": "2025-03-02T01:00:00+00:00",
+                    "predicted_trend": "bull",
+                    "confidence_bull": 90.0,
+                    "confidence_bear": 5.0,
+                    "confidence_flat": 5.0,
+                },
+                {
+                    "signal_time_utc": "2025-03-03T01:00:00+00:00",
+                    "horizon_end_utc": "2025-03-04T01:00:00+00:00",
+                    "predicted_trend": "bear",
+                    "confidence_bull": 5.0,
+                    "confidence_bear": 90.0,
+                    "confidence_flat": 5.0,
+                },
+            ],
+        }
+    )
+
+    assert captured["timeframe"] == "1h"
+    assert captured["bars"] == 120
+    assert captured["start_time"] == "2025-01-01T00:00:00+00:00"
+    assert captured["end_time"] == "2025-01-06T00:00:00+00:00"
+
+
+async def test_ai_backtest_without_explicit_dates_does_not_use_forecast_window() -> None:
+    service = BacktestingService()
+    captured: dict[str, object] = {}
+
+    async def _fake_load_market_frame(**kwargs: object) -> pd.DataFrame:
+        captured.update(kwargs)
+        frame = pd.DataFrame(_candles(120))
+        frame["time"] = pd.to_datetime(frame["time"], utc=True)
+        return frame.set_index("time")[["open", "high", "low", "close", "volume"]].astype(float)
+
+    service.load_market_frame = _fake_load_market_frame
+    await service._load_market_frame_from_payload(
+        {
+            "symbol": "BTC/USDT",
+            "timeframe": "4h",
+            "bars": 120,
+            "run_with_ai": True,
+            "ai_forecast_rows": [
+                {
+                    "signal_time_utc": "2025-03-01T01:00:00+00:00",
+                    "horizon_end_utc": "2025-03-02T01:00:00+00:00",
+                    "predicted_trend": "bull",
+                    "confidence_bull": 90.0,
+                    "confidence_bear": 5.0,
+                    "confidence_flat": 5.0,
+                },
+            ],
+        }
+    )
+
+    assert captured["timeframe"] == "4h"
+    assert captured["bars"] == 120
+    assert "start_time" not in captured
+    assert "end_time" not in captured
+
+
+async def test_internal_compare_endpoint_returns_extended_delta_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-internal")
+    get_settings.cache_clear()
+    payload = {
+        "strategy": "vwap",
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 180,
+        "data_config": {
+            "candles": _candles(180),
+        },
+        "algo_config": {
+            "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+            "regime": "Flat",
+            "ai_bull_confidence_threshold": 70.0,
+            "ai_bear_confidence_threshold": 70.0,
+        },
+        "ai_forecast_rows": [
+            {
+                "signal_time_utc": "2025-01-01T00:00:00+00:00",
+                "predicted_trend": "bull",
+                "confidence_bull": 90.0,
+                "confidence_bear": 5.0,
+                "confidence_flat": 5.0,
+            }
+        ],
+    }
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/internal/backtest/compare",
+                json=payload,
+                headers={"X-Internal-API-Key": "test-internal"},
+            )
+        assert response.status_code == 200
+        comparison = response.json()["comparison"]
+        assert set(comparison.keys()) == {
+            "total_pnl_delta",
+            "win_rate_delta",
+            "trades_delta",
+            "profit_factor_delta",
+            "sharpe_proxy_delta",
+            "max_drawdown_delta",
+            "calmar_ratio_delta",
+        }
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_internal_compare_endpoint_includes_core_metrics_for_non_vwap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("INTERNAL_API_KEY", "test-internal")
+    get_settings.cache_clear()
+    payload = {
+        "strategy": "intraday-momentum",
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 220,
+        "data_config": {
+            "candles": _candles(220),
+        },
+        "algo_config": {
+            "side": "long",
+            "ai_bull_confidence_threshold": 70.0,
+            "ai_bear_confidence_threshold": 70.0,
+        },
+        "ai_forecast_rows": [
+            {
+                "signal_time_utc": "2025-01-01T00:00:00+00:00",
+                "predicted_trend": "bull",
+                "confidence_bull": 90.0,
+                "confidence_bear": 5.0,
+                "confidence_flat": 5.0,
+            }
+        ],
+    }
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/internal/backtest/compare",
+                json=payload,
+                headers={"X-Internal-API-Key": "test-internal"},
+            )
+        assert response.status_code == 200
+        body = response.json()
+        for summary in [body["result"]["summary"], body["baseline"]["summary"]]:
+            assert "win_rate" in summary
+            assert "max_drawdown" in summary
+            assert "max_drawdown_pct" in summary
+            assert "annualized_return_pct" in summary
+            assert "calmar_ratio" in summary
+            assert "sharpe_proxy" in summary
+            assert "walk_forward_stability" in summary
+        assert "max_drawdown_delta" in body["comparison"]
+        assert "sharpe_proxy_delta" in body["comparison"]
+        assert "calmar_ratio_delta" in body["comparison"]
+    finally:
+        get_settings.cache_clear()
+
+
+async def test_vwap_backtest_with_ai_requires_file_name() -> None:
+    payload = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 140,
+        "candles": _candles(),
+        "enabled": ["VWAP", "MACD"],
+        "regime": "Bull",
+        "run_with_ai": True,
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/backtest/vwap", json=payload)
+    assert response.status_code == 422
 
 
 async def test_vwap_indicators_endpoint_returns_actual_allowlist() -> None:
@@ -152,6 +568,7 @@ async def test_backtest_catalog_endpoint_returns_client_form_metadata() -> None:
     assert "builtin_strategy_params" in body["portfolio"]
     assert "VWAP Builder" in body["portfolio"]["builtin_strategy_params"]
     assert "enabled" in body["portfolio"]["builtin_strategy_params"]["VWAP Builder"]
+    assert "run_with_ai" in body["portfolio"]["builtin_strategy_params"]["VWAP Builder"]
 
 
 async def test_vwap_backtest_uses_backend_market_fetch_when_candles_absent(
@@ -235,9 +652,48 @@ async def test_portfolio_backtest_endpoint_returns_equity() -> None:
     assert response.status_code == 200
     body = response.json()
     assert "equity" in body["chart_points"]
+    assert "r_cumulative_curve" in body["chart_points"]
+    assert "r_equity_curve" in body["chart_points"]
     assert body["summary"]["final_equity"] == 5060.0
+    assert body["summary"]["r_squared"] == 0.0
+    assert body["summary"]["r_cumulative"] == 0.0
+    assert body["summary"]["calmar_ratio"] > 0.0
     assert "client_values" in body["summary"]
     assert body["summary"]["client_values"]["finalEquity"] == 5060.0
+    assert body["summary"]["client_values"]["calmarRatio"] == body["summary"]["calmar_ratio"]
+
+
+async def test_portfolio_backtest_with_ai_returns_comparison_shape() -> None:
+    payload = {
+        "total_capital": 5000,
+        "run_with_ai": True,
+        "ai_forecast_rows": [
+            {
+                "signal_time_utc": "2025-01-01T00:00:00+00:00",
+                "predicted_trend": "bull",
+                "confidence_bull": 90.0,
+                "confidence_bear": 5.0,
+                "confidence_flat": 5.0,
+            }
+        ],
+        "strategies": [
+            {
+                "name": "s1",
+                "trades": [
+                    {"exit_time": "2025-01-01T00:00:00+00:00", "pnl_usdt": 100},
+                ],
+            }
+        ],
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/backtest/portfolio", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"result", "baseline", "comparison"}
+    assert body["result"]["summary"]["final_equity"] == 5100.0
+    assert body["baseline"]["summary"]["final_equity"] == 5100.0
+    assert body["comparison"]["total_pnl_delta"] == 0.0
 
 
 async def test_portfolio_backtest_supports_user_and_builtin_split_payload(
@@ -283,6 +739,28 @@ async def test_portfolio_backtest_supports_user_and_builtin_split_payload(
     assert body["explanations"][0]["strategy"] == "Saved VWAP"
 
 
+async def test_portfolio_backtest_async_accepts_user_strategies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_kiq(payload: dict[str, object]) -> SimpleNamespace:
+        assert payload["async_job"] is True
+        assert payload["user_strategies"] == [{"strategy_id": 7, "allocation_pct": 100.0}]
+        return SimpleNamespace(task_id="task-123")
+
+    monkeypatch.setattr(backtest_endpoint.run_portfolio_backtest, "kiq", _fake_kiq)
+
+    payload = {
+        "total_capital": 10_000,
+        "user_strategies": [{"strategy_id": 7, "allocation_pct": 100.0}],
+        "async_job": True,
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/backtest/portfolio", json=payload)
+    assert response.status_code == 200
+    assert response.json() == {"status": "queued", "task_id": "task-123"}
+
+
 async def test_portfolio_service_resolves_saved_strategies_by_user_and_id(
     backtest_db: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -311,6 +789,229 @@ async def test_portfolio_service_resolves_saved_strategies_by_user_and_id(
     assert resolved[1]["name"] == "My Strategy"
     assert resolved[1]["weight"] == 60.0
     assert resolved[1]["config"]["strategy_type"] == "builder_vwap"
+
+
+async def test_portfolio_service_runs_saved_vwap_strategy_with_ai_forecast(
+    backtest_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with backtest_db() as session:
+        row = Strategy(
+            user_id=1,
+            name="My AI VWAP",
+            strategy_type="builder_vwap",
+            config={
+                "symbol": "BTC/USDT",
+                "timeframe": "1h",
+                "bars": 140,
+                "enabled": ["VWAP", "MACD"],
+                "run_with_ai": True,
+                "ai_forecast_file": "forecast.csv",
+            },
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+
+        captured: dict[str, object] = {}
+
+        async def _fake_run_vwap_with_ai(self, payload: dict[str, object]) -> dict[str, object]:
+            captured["payload"] = payload
+            return {
+                "baseline": {"summary": {}, "trades": [], "chart_points": {}, "explanations": []},
+                "ai_forecast": {
+                    "summary": {},
+                    "trades": [
+                        {
+                            "exit_time": "2025-01-01T00:00:00+00:00",
+                            "pnl_usdt": 125.0,
+                        }
+                    ],
+                    "chart_points": {},
+                    "explanations": [],
+                },
+            }
+
+        monkeypatch.setattr(
+            "app.services.backtesting.service.BacktestingService.run_vwap_with_ai",
+            _fake_run_vwap_with_ai,
+        )
+
+        async def _fail_run_vwap(self, payload: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("Expected AI run path for run_with_ai strategy")
+
+        monkeypatch.setattr(
+            "app.services.backtesting.service.BacktestingService.run_vwap",
+            _fail_run_vwap,
+        )
+
+        service = BacktestingService()
+        result = await service.run_portfolio(
+            {
+                "total_capital": 10_000,
+                "user_id": 1,
+                "user_strategies": [{"strategy_id": row.id, "allocation_pct": 100.0}],
+                "session": session,
+            }
+        )
+
+    assert captured["payload"]["run_with_ai"] is True
+    assert result["summary"]["total_events"] == 1
+    assert result["summary"]["final_equity"] == 10_125.0
+    assert result["trades"][0]["pnl_usdt"] == 125.0
+
+
+async def test_portfolio_service_applies_top_level_ai_forecast_to_saved_strategy(
+    backtest_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with backtest_db() as session:
+        row = Strategy(
+            user_id=1,
+            name="My Plain VWAP",
+            strategy_type="builder_vwap",
+            config={
+                "symbol": "BTC/USDT",
+                "timeframe": "1h",
+                "bars": 140,
+                "enabled": ["VWAP", "MACD"],
+            },
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+
+        captured: dict[str, object] = {}
+
+        async def _fake_run_vwap_with_ai(self, payload: dict[str, object]) -> dict[str, object]:
+            captured["payload"] = payload
+            return {
+                "baseline": {"summary": {}, "trades": [], "chart_points": {}, "explanations": []},
+                "ai_forecast": {
+                    "summary": {},
+                    "trades": [
+                        {
+                            "exit_time": "2025-01-01T00:00:00+00:00",
+                            "pnl_usdt": 75.0,
+                            "ai_forecast_applied": True,
+                            "ai_regime": "Bull",
+                        }
+                    ],
+                    "chart_points": {},
+                    "explanations": [],
+                },
+            }
+
+        monkeypatch.setattr(
+            "app.services.backtesting.service.BacktestingService.run_vwap_with_ai",
+            _fake_run_vwap_with_ai,
+        )
+
+        async def _fake_run_vwap(self, payload: dict[str, object]) -> dict[str, object]:
+            assert payload["run_with_ai"] is False
+            return {
+                "summary": {},
+                "trades": [
+                    {
+                        "exit_time": "2025-01-01T00:00:00+00:00",
+                        "pnl_usdt": 50.0,
+                    }
+                ],
+                "chart_points": {},
+                "explanations": [],
+            }
+
+        monkeypatch.setattr(
+            "app.services.backtesting.service.BacktestingService.run_vwap",
+            _fake_run_vwap,
+        )
+
+        ai_rows = [
+            {
+                "signal_time_utc": "2025-01-01T00:00:00+00:00",
+                "predicted_trend": "bull",
+                "confidence_bull": 90.0,
+                "confidence_bear": 5.0,
+                "confidence_flat": 5.0,
+            }
+        ]
+        service = BacktestingService()
+        result = await service.run_portfolio(
+            {
+                "total_capital": 10_000,
+                "user_id": 1,
+                "user_strategies": [{"strategy_id": row.id, "allocation_pct": 100.0}],
+                "session": session,
+                "run_with_ai": True,
+                "ai_forecast_rows": ai_rows,
+                "ai_bull_confidence_threshold": 65.0,
+                "ai_bear_confidence_threshold": 60.0,
+            }
+        )
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["run_with_ai"] is True
+    assert payload["ai_forecast_rows"] == ai_rows
+    assert payload["ai_bull_confidence_threshold"] == 65.0
+    assert payload["ai_bear_confidence_threshold"] == 60.0
+    assert set(result.keys()) == {"result", "baseline", "comparison"}
+    assert result["baseline"]["summary"]["final_equity"] == 10_050.0
+    assert result["result"]["summary"]["final_equity"] == 10_075.0
+    assert result["comparison"]["total_pnl_delta"] == 25.0
+    assert result["result"]["summary"]["ai_forecast_applied"] is True
+    assert result["result"]["summary"]["ai_forecast_events"] == 1
+    assert result["result"]["trades"][0]["ai_forecast_applied"] is True
+    assert result["result"]["trades"][0]["ai_regime"] == "Bull"
+
+
+async def test_portfolio_service_resolves_user_strategies_without_session(
+    backtest_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with backtest_db() as session:
+        row = Strategy(
+            user_id=1,
+            name="My VWAP",
+            strategy_type="builder_vwap",
+            config={
+                "symbol": "BTC/USDT",
+                "timeframe": "1h",
+                "bars": 140,
+                "enabled": ["VWAP", "MACD"],
+            },
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+
+    monkeypatch.setattr("app.services.backtesting.service.AsyncSessionFactory", backtest_db)
+
+    async def _fake_run_vwap(self, payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "summary": {},
+            "trades": [{"exit_time": "2025-01-01T00:00:00+00:00", "pnl_usdt": 50.0}],
+            "chart_points": {},
+            "explanations": [],
+        }
+
+    monkeypatch.setattr(
+        "app.services.backtesting.service.BacktestingService.run_vwap",
+        _fake_run_vwap,
+    )
+
+    service = BacktestingService()
+    result = await service.run_portfolio(
+        {
+            "total_capital": 5_000,
+            "user_id": 1,
+            "user_strategies": [{"strategy_id": row.id, "allocation_pct": 100.0}],
+        }
+    )
+
+    assert result["summary"]["total_events"] == 1
+    assert result["summary"]["final_equity"] == 5_050.0
+    assert result["trades"][0]["pnl_usdt"] == 50.0
 
 
 async def test_vwap_backtest_rejects_unknown_indicators() -> None:

@@ -1,16 +1,18 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
 from app.schemas.market import MARKET_EXCHANGE_DEFAULT
-from app.services.backtesting.atr_order_block import run_atr_order_block
-from app.services.backtesting.common import add_client_summary_fields, annotate_trade_confirmations
-from app.services.backtesting.grid_bot import run_grid_bot
-from app.services.backtesting.intraday_momentum import run_intraday_momentum
-from app.services.backtesting.knife_catcher import run_knife_catcher
-from app.services.backtesting.vwap_builder import run_vwap_backtest
-from app.services.indicators.engine import calc_indicators
+from app.services.backtesting.common import (
+    add_capital_metrics,
+    add_client_summary_fields,
+    annotate_trade_confirmations,
+    build_r_chart_points,
+)
 from app.services.market_data.service import MarketDataService
+
+if TYPE_CHECKING:
+    from app.services.backtesting.service import BacktestingService
 
 DISPLAY_TO_ENGINE = {
     "VWAP Builder": "builder_vwap",
@@ -19,6 +21,20 @@ DISPLAY_TO_ENGINE = {
     "Grid BOT": "grid_bot",
     "Intraday Momentum": "intraday_momentum",
 }
+PORTFOLIO_TRADE_COLUMNS = (
+    "exit_time",
+    "strategy",
+    "pnl_usdt",
+    "entry_time",
+    "side",
+    "regime",
+    "ai_forecast_applied",
+    "ai_base_regime",
+    "ai_regime",
+    "ai_regime_changed",
+    "ai_signal_time_utc",
+    "ai_horizon_end_utc",
+)
 
 
 def _normalized_weights(items: list[dict[str, Any]]) -> dict[str, float]:
@@ -57,7 +73,7 @@ def _resolve_engine(strategy: dict[str, Any]) -> str | None:
 
 async def _run_strategy_backtest(
     strategy: dict[str, Any],
-    market_service: MarketDataService,
+    backtesting_service: "BacktestingService",
 ) -> list[dict[str, Any]]:
     engine = _resolve_engine(strategy)
     if engine not in {
@@ -67,37 +83,39 @@ async def _run_strategy_backtest(
         "grid_bot",
         "intraday_momentum",
     }:
-        return strategy.get("trades", [])
+        raw_trades = strategy.get("trades", [])
+        return raw_trades if isinstance(raw_trades, list) else []
 
-    config = strategy.get("config", {}) or {}
-    symbol = str(config.get("symbol", "BTC/USDT"))
-    timeframe = str(config.get("timeframe", "1h"))
-    bars = int(config.get("bars", 500))
-    exchange_name = str(config.get("exchange_name", MARKET_EXCHANGE_DEFAULT))
-    candles = config.get("candles")
-    if candles:
-        df = market_service.frame_from_candles(candles)
-    else:
-        df = await market_service.fetch_ohlcv(
-            exchange_name=exchange_name,
-            symbol=symbol,
-            timeframe=timeframe,
-            bars=bars,
-        )
+    config = {
+        "exchange_name": MARKET_EXCHANGE_DEFAULT,
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 500,
+        **(strategy.get("config", {}) or {}),
+    }
 
     if engine == "builder_vwap":
-        result = run_vwap_backtest(df, calc_indicators(df), config)
+        if bool(config.get("run_with_ai", False)):
+            comparison = await backtesting_service.run_vwap_with_ai(config)
+            ai_result = comparison.get("ai_forecast")
+            if not isinstance(ai_result, dict):
+                raise ValueError("VWAP AI comparison payload is invalid.")
+            ai_trades = ai_result.get("trades", [])
+            return ai_trades if isinstance(ai_trades, list) else []
+        result = await backtesting_service.run_vwap(config)
     elif engine == "atr_order_block":
-        result = run_atr_order_block(df, config)
+        result = await backtesting_service.run_atr_order_block(config)
     elif engine == "knife_catcher":
-        result = run_knife_catcher(df, config)
+        result = await backtesting_service.run_knife(config)
     elif engine == "grid_bot":
-        result = run_grid_bot(df, config)
+        result = await backtesting_service.run_grid(config)
     elif engine == "intraday_momentum":
-        result = run_intraday_momentum(df, config)
+        result = await backtesting_service.run_intraday(config)
     else:
-        return strategy.get("trades", [])
-    return result.get("trades", [])
+        raw_trades = strategy.get("trades", [])
+        return raw_trades if isinstance(raw_trades, list) else []
+    resolved_trades = result.get("trades", [])
+    return resolved_trades if isinstance(resolved_trades, list) else []
 
 
 async def run_portfolio(
@@ -106,21 +124,50 @@ async def run_portfolio(
     market_data: MarketDataService | None = None,
 ) -> dict[str, Any]:
     if not strategies or total_capital <= 0:
+        initial = float(total_capital) if total_capital > 0 else 0.0
         return {
-            "summary": add_client_summary_fields({"total_strategies": 0}),
+            "summary": add_client_summary_fields(
+                {
+                    "total_strategies": 0,
+                    "total_events": 0,
+                    "allocated_capital": initial,
+                    "final_equity": initial,
+                    "initial_balance": initial,
+                    "final_balance": initial,
+                    "total_pnl_usdt": 0.0,
+                    "total_pnl": 0.0,
+                    "total_return_pct": 0.0,
+                    "avg_risk_per_trade": 0.0,
+                    "avg_r": 0.0,
+                    "total_r": 0.0,
+                    "r_cumulative": 0.0,
+                    "r_squared": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "annualized_return_pct": 0.0,
+                    "calmar_ratio": 0.0,
+                }
+            ),
             "trades": [],
-            "chart_points": {},
+            "chart_points": {
+                "equity": [initial],
+                "equity_curve": [{"step": 0, "time": None, "equity": initial, "pnl_usdt": 0.0}],
+                "r_cumulative_curve": [0.0],
+                "r_equity_curve": [0.0],
+            },
             "explanations": [],
         }
 
     weights = _normalized_weights(strategies)
     strategy_results: list[dict[str, Any]] = []
     market_service = market_data or MarketDataService()
+    from app.services.backtesting.service import BacktestingService
+
+    backtesting_service = BacktestingService(market_data=market_service)
     for strategy in strategies:
         strategy_name = str(strategy.get("name", "unknown"))
         engine = _resolve_engine(strategy)
         if engine:
-            trades = await _run_strategy_backtest(strategy, market_service)
+            trades = await _run_strategy_backtest(strategy, backtesting_service)
             strategy_results.append({"name": strategy_name, "trades": trades})
             continue
         strategy_results.append(strategy)
@@ -128,26 +175,35 @@ async def run_portfolio(
     frames: list[pd.DataFrame] = []
     stats: list[dict[str, Any]] = []
     for strategy in strategy_results:
-        trades = pd.DataFrame(strategy.get("trades", []))
-        if trades.empty or "pnl_usdt" not in trades.columns:
+        strategy_trades_df = pd.DataFrame(strategy.get("trades", []))
+        if strategy_trades_df.empty or "pnl_usdt" not in strategy_trades_df.columns:
             continue
         strategy_name = str(strategy.get("name", "unknown"))
         weight = float(weights.get(strategy_name, 0.0))
         if weight <= 0:
             continue
         capital = float(total_capital) * weight
-        trades = trades.copy()
-        trades["pnl_usdt"] = trades["pnl_usdt"].astype(float)
-        if "allocation_usdt" in trades.columns:
-            allocated = pd.to_numeric(trades["allocation_usdt"], errors="coerce")
+        strategy_trades_df = strategy_trades_df.copy()
+        strategy_trades_df["pnl_usdt"] = strategy_trades_df["pnl_usdt"].astype(float)
+        if "allocation_usdt" in strategy_trades_df.columns:
+            allocated = pd.to_numeric(strategy_trades_df["allocation_usdt"], errors="coerce")
             scale = allocated.replace(0, pd.NA)
-            trades["pnl_usdt"] = (trades["pnl_usdt"] / scale).fillna(trades["pnl_usdt"]) * capital
-        elif "final_pnl" in trades.columns:
-            trades["pnl_usdt"] = (
-                pd.to_numeric(trades["final_pnl"], errors="coerce").fillna(0.0) * capital
+            strategy_trades_df["pnl_usdt"] = (
+                strategy_trades_df["pnl_usdt"] / scale
+            ).fillna(strategy_trades_df["pnl_usdt"]) * capital
+        elif "final_pnl" in strategy_trades_df.columns:
+            strategy_trades_df["pnl_usdt"] = (
+                pd.to_numeric(
+                    strategy_trades_df["final_pnl"],
+                    errors="coerce",
+                ).fillna(0.0)
+                * capital
             )
-        trades["strategy"] = strategy_name
-        frames.append(trades[["exit_time", "strategy", "pnl_usdt"]])
+        strategy_trades_df["strategy"] = strategy_name
+        frame_columns = [
+            column for column in PORTFOLIO_TRADE_COLUMNS if column in strategy_trades_df.columns
+        ]
+        frames.append(strategy_trades_df[frame_columns])
         stats.append(
             add_client_summary_fields(
                 {
@@ -155,52 +211,84 @@ async def run_portfolio(
                     "weight": weight,
                     "allocation_pct": weight * 100.0,
                     "capital": capital,
-                    "trades": int(len(trades)),
-                    "win_rate": float((trades["pnl_usdt"] > 0).mean() * 100),
-                    "total_pnl_usdt": float(trades["pnl_usdt"].sum()),
+                    "trades": int(len(strategy_trades_df)),
+                    "win_rate": float((strategy_trades_df["pnl_usdt"] > 0).mean() * 100),
+                    "total_pnl_usdt": float(strategy_trades_df["pnl_usdt"].sum()),
                 }
             )
         )
     if not frames:
+        initial = float(total_capital)
         return {
-            "summary": add_client_summary_fields({"total_strategies": 0}),
+            "summary": add_client_summary_fields(
+                {
+                    "total_strategies": 0,
+                    "total_events": 0,
+                    "allocated_capital": initial,
+                    "final_equity": initial,
+                    "initial_balance": initial,
+                    "final_balance": initial,
+                    "total_pnl_usdt": 0.0,
+                    "total_pnl": 0.0,
+                    "total_return_pct": 0.0,
+                    "avg_risk_per_trade": 0.0,
+                    "avg_r": 0.0,
+                    "total_r": 0.0,
+                    "r_cumulative": 0.0,
+                    "r_squared": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "annualized_return_pct": 0.0,
+                    "calmar_ratio": 0.0,
+                }
+            ),
             "trades": [],
-            "chart_points": {},
+            "chart_points": {
+                "equity": [initial],
+                "equity_curve": [{"step": 0, "time": None, "equity": initial, "pnl_usdt": 0.0}],
+                "r_cumulative_curve": [0.0],
+                "r_equity_curve": [0.0],
+            },
             "explanations": [],
         }
     events = pd.concat(frames, ignore_index=True)
     events["exit_time"] = pd.to_datetime(events["exit_time"])
     events = events.sort_values("exit_time")
-    equity = [total_capital]
-    for pnl in events["pnl_usdt"].values:
-        equity.append(equity[-1] + float(pnl))
-    trades = annotate_trade_confirmations(events.to_dict(orient="records"))
-    summary = add_client_summary_fields(
-        {
+    event_rows = events.to_dict(orient="records")
+    trades = annotate_trade_confirmations(
+        [{str(key): value for key, value in row.items()} for row in event_rows]
+    )
+    ai_events = len([trade for trade in trades if trade.get("ai_forecast_applied") is True])
+    summary, equity_curve = add_capital_metrics(
+        summary={
             "total_strategies": len(stats),
             "total_events": int(len(events)),
             "allocated_capital": float(total_capital),
-            "final_equity": float(equity[-1]),
-            "total_pnl_usdt": float(equity[-1] - total_capital),
-            "initial_balance": float(total_capital),
-            "final_balance": float(equity[-1]),
-            "total_pnl": float(equity[-1] - total_capital),
-            "avg_risk_per_trade": 0.0,
-        }
+            "final_equity": float(total_capital + events["pnl_usdt"].sum()),
+            "total_pnl_usdt": float(events["pnl_usdt"].sum()),
+            "ai_forecast_applied": ai_events > 0,
+            "ai_forecast_events": ai_events,
+        },
+        trades=trades,
+        initial_balance=float(total_capital),
     )
-    equity_curve = [{"step": 0, "time": None, "equity": float(total_capital), "pnl_usdt": 0.0}]
-    for idx, row in enumerate(events.itertuples(index=False), start=1):
-        equity_curve.append(
-            {
-                "step": idx,
-                "time": str(row.exit_time),
-                "equity": float(equity[idx]),
-                "pnl_usdt": float(row.pnl_usdt),
-            }
-        )
+    r_chart_points = build_r_chart_points(trades)
+    equity: list[float] = []
+    for point in equity_curve:
+        raw_equity = point.get("equity")
+        if isinstance(raw_equity, bool):
+            equity.append(0.0)
+        elif isinstance(raw_equity, (int, float)):
+            equity.append(float(raw_equity))
+        elif isinstance(raw_equity, str):
+            try:
+                equity.append(float(raw_equity))
+            except ValueError:
+                equity.append(0.0)
+        else:
+            equity.append(0.0)
     return {
         "summary": summary,
         "trades": trades,
-        "chart_points": {"equity": equity, "equity_curve": equity_curve},
+        "chart_points": {"equity": equity, "equity_curve": equity_curve, **r_chart_points},
         "explanations": stats,
     }

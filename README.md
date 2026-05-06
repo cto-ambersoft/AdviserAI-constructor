@@ -68,6 +68,7 @@ trade_platform/
 ## Backtest API contracts
 
 - `POST /api/v1/backtest/vwap`
+- `GET /api/v1/backtest/ai-forecast-files`
 - `GET /api/v1/backtest/vwap/indicators`
 - `GET /api/v1/backtest/vwap/presets`
 - `GET /api/v1/backtest/vwap/regimes`
@@ -119,6 +120,96 @@ VWAP indicator selection behavior:
 - Unknown indicator names are rejected with `422` validation error.
 - VWAP supports stop modes: `ATR`, `Swing`, `Order Block (ATR-OB)`.
 - VWAP risk sizing supports `max_position_pct` cap and returns per-trade `sl_explain`.
+- Optional AI forecast integration for VWAP:
+  - `run_with_ai` (default `false`)
+  - `ai_forecast_file` (required if `run_with_ai=true`, must be CSV from `exports`)
+  - `ai_bull_confidence_threshold` and `ai_bear_confidence_threshold` in range `0..100`
+  - when thresholds are not provided, runtime defaults are `52.0` for bull and bear
+  - AI CSV must include: `signal_time_utc`, `predicted_trend`, `confidence_bull`, `confidence_bear`, `confidence_flat`
+
+AI forecast file catalog:
+
+- `GET /api/v1/backtest/ai-forecast-files` returns all available `.csv` files from `exports`:
+  - `file_name`
+  - `modified_at_utc`
+- In production (Docker/server), set `AI_FORECAST_EXPORTS_DIR` if files are stored outside the default working directory:
+  - example: `AI_FORECAST_EXPORTS_DIR=/home/ubuntu/adviser-ai/trade/exports`
+  - relative values are resolved from current process working directory.
+
+VWAP response behavior with AI enabled:
+
+- If `run_with_ai=false`, response shape stays unchanged:
+  - `summary`, `trades`, `chart_points`, `explanations`
+- If `run_with_ai=true`, endpoint returns compact comparison payload:
+  - `result`: final result with per-bar AI regime override
+  - `baseline`: result without AI override (with stripped `chart_points` to reduce payload size)
+  - `comparison`: precomputed deltas (`total_pnl_delta`, `win_rate_delta`, `trades_delta`)
+- In AI mode, strategy resolves regime for each bar from latest AI signal (`signal_time_utc <= bar_time`):
+  - bars before the first AI signal fall back to request `regime`
+  - low-confidence `bull`/`bear` predictions fall back to request `regime`
+  - `flat` predictions also respect confidence (`confidence_flat`) and fall back to request `regime` when confidence is low
+  - `bull` AI blocks shorts, `bear` AI blocks longs
+
+Example: list AI forecast files
+
+```http
+GET /api/v1/backtest/ai-forecast-files
+```
+
+```json
+{
+  "files": [
+    {
+      "file_name": "ai_forecast_backtest_btc_1h.csv",
+      "modified_at_utc": "2026-03-24T08:21:55+00:00"
+    }
+  ]
+}
+```
+
+Example: run VWAP with AI comparison
+
+```http
+POST /api/v1/backtest/vwap
+Content-Type: application/json
+```
+
+```json
+{
+  "symbol": "BTC/USDT",
+  "timeframe": "1h",
+  "bars": 500,
+  "regime": "Flat",
+  "preset": "Custom",
+  "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+  "run_with_ai": true,
+  "ai_forecast_file": "ai_forecast_backtest_btc_1h.csv",
+  "ai_bull_confidence_threshold": 70.0,
+  "ai_bear_confidence_threshold": 70.0
+}
+```
+
+```json
+{
+  "result": {
+    "summary": {},
+    "trades": [],
+    "chart_points": {},
+    "explanations": []
+  },
+  "baseline": {
+    "summary": {},
+    "trades": [],
+    "chart_points": {},
+    "explanations": []
+  },
+  "comparison": {
+    "total_pnl_delta": 0.0,
+    "win_rate_delta": 0.0,
+    "trades_delta": 0
+  }
+}
+```
 
 Strategy sizing/capital behavior:
 

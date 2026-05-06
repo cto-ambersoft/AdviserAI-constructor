@@ -46,11 +46,14 @@ class Settings(BaseSettings):
     cors_allow_methods: list[str] = ["*"]
     cors_allow_headers: list[str] = ["*"]
     cors_allow_credentials: bool = False
+    ai_forecast_exports_dir: str = "exports"
+    internal_api_key: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     @property
