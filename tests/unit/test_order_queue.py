@@ -156,7 +156,8 @@ async def test_emergency_priority_bypasses_all_pending_tasks(
     assert executed[0] == "place_sl"
 
 
-async def test_enqueue_deduplicates_same_position_action_and_keeps_latest_params() -> None:
+async def test_enqueue_replace_sl_with_same_target_coalesces_to_latest_params() -> None:
+    """replace_sl with identical target price coalesces (latest params win)."""
     adapter = AsyncMock(spec=ExchangeAdapter)
     queue = OrderExecutionQueue(adapter=adapter, account_id="acc-3")
 
@@ -184,8 +185,8 @@ async def test_enqueue_deduplicates_same_position_action_and_keeps_latest_params
             params={
                 "symbol": "BTC/USDT:USDT",
                 "existing_order_id": "old-sl",
-                "new_trigger_price": 98500.0,
-                "new_quantity": 0.5,
+                "new_trigger_price": 98000.0,  # SAME target → coalesce
+                "new_quantity": 0.4,
                 "client_order_id": "replace-sl-2",
             },
         )
@@ -196,8 +197,56 @@ async def test_enqueue_deduplicates_same_position_action_and_keeps_latest_params
     task = await asyncio.wait_for(queue._queue.get(), timeout=1.0)
     queue._queue.task_done()
 
-    assert task.params["new_trigger_price"] == pytest.approx(98500.0)
+    assert task.params["new_trigger_price"] == pytest.approx(98000.0)
+    assert task.params["new_quantity"] == pytest.approx(0.4)
     assert task.params["client_order_id"] == "replace-sl-2"
+    # The coalesce path bumps created_at so the latest-intent replacement
+    # is processed at the freshest priority.
+    assert task.created_at == pytest.approx(2.0)
+
+
+async def test_enqueue_replace_sl_with_different_target_does_not_coalesce() -> None:
+    """Two replace_sl tasks with different target prices both reach the queue.
+
+    SL is safety-critical — silently merging a "move SL to 98000" with a "move SL
+    to 98500" would lose the latter intent and leave the position at the wrong
+    SL. Different targets must therefore be treated as distinct tasks.
+    """
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    queue = OrderExecutionQueue(adapter=adapter, account_id="acc-3")
+
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.SL_ADJUSTMENT,
+            created_at=1.0,
+            position_id="position_1",
+            action="replace_sl",
+            params={
+                "symbol": "BTC/USDT:USDT",
+                "existing_order_id": "old-sl",
+                "new_trigger_price": 98000.0,
+                "new_quantity": 0.5,
+                "client_order_id": "replace-sl-1",
+            },
+        )
+    )
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.SL_ADJUSTMENT,
+            created_at=2.0,
+            position_id="position_1",
+            action="replace_sl",
+            params={
+                "symbol": "BTC/USDT:USDT",
+                "existing_order_id": "old-sl",
+                "new_trigger_price": 98500.0,  # DIFFERENT target → 2 tasks
+                "new_quantity": 0.5,
+                "client_order_id": "replace-sl-2",
+            },
+        )
+    )
+
+    assert queue._queue.qsize() == 2
 
 
 async def test_transient_error_retries_and_reenqueues_task(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -286,6 +335,170 @@ async def test_sl_max_retries_escalates_to_emergency_market_close(
     emergency_kwargs = adapter.partial_close.call_args.kwargs
     assert emergency_kwargs["order_type"] == "market"
     assert emergency_kwargs["quantity"] == pytest.approx(1.0)
+
+
+async def test_purge_pending_removes_matching_actions_and_tombstones_them() -> None:
+    """``purge_pending`` drops in-flight protective tasks for a position.
+
+    Used when a position transitions to CLOSED so the WS-manager-side
+    cancel cleanup does not race with a queued ``replace_sl`` /
+    ``place_sl`` / ``place_tp``. After purge, the dispatcher must not
+    invoke the adapter for the dropped tasks.
+    """
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    adapter.can_place_order.return_value = True
+
+    queue = OrderExecutionQueue(adapter=adapter, account_id="acc-purge")
+
+    base_params: dict[str, Any] = {
+        "symbol": "BTC/USDT:USDT",
+        "side": OrderSide.SELL,
+        "client_order_id": "any",
+    }
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.SL_ADJUSTMENT,
+            created_at=1.0,
+            position_id="pos-purge",
+            action="place_sl",
+            params={
+                **base_params,
+                "quantity": 0.1,
+                "trigger_price": 98000.0,
+                "client_order_id": "sl-1",
+            },
+        )
+    )
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.SL_ADJUSTMENT,
+            created_at=2.0,
+            position_id="pos-purge",
+            action="replace_sl",
+            params={
+                "symbol": "BTC/USDT:USDT",
+                "existing_order_id": "old-sl",
+                "new_trigger_price": 98500.0,
+                "new_quantity": 0.1,
+                "client_order_id": "rsl-1",
+            },
+        )
+    )
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.NEW_CONDITIONAL,
+            created_at=3.0,
+            position_id="pos-purge",
+            action="place_tp",
+            params={
+                **base_params,
+                "level": 2,
+                "quantity": 0.1,
+                "trigger_price": 105000.0,
+                "client_order_id": "tp-1",
+            },
+        )
+    )
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.CANCEL_ORDER,
+            created_at=4.0,
+            position_id="pos-purge",
+            action="cancel_order",
+            params={"symbol": "BTC/USDT:USDT", "order_id": "old-1"},
+        )
+    )
+    # Sibling position must not be affected.
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.SL_ADJUSTMENT,
+            created_at=5.0,
+            position_id="pos-other",
+            action="place_sl",
+            params={
+                **base_params,
+                "quantity": 0.2,
+                "trigger_price": 97000.0,
+                "client_order_id": "sl-other",
+            },
+        )
+    )
+
+    purged_keys = await queue.purge_pending(
+        "pos-purge", {"place_sl", "replace_sl", "place_tp", "replace_tp"}
+    )
+
+    # Three of the four pos-purge tasks (place_sl, replace_sl, place_tp)
+    # should be tombstoned; cancel_order remains; pos-other untouched.
+    assert len(purged_keys) == 3
+    remaining = list(queue._pending_tasks.keys())
+    assert any(key.endswith(":cancel_order:order:old-1") for key in remaining)
+    assert any(key.startswith("pos-other:") for key in remaining)
+    assert not any(key.startswith("pos-purge:place_sl") for key in remaining)
+    assert not any(key.startswith("pos-purge:replace_sl") for key in remaining)
+    assert not any(key.startswith("pos-purge:place_tp") for key in remaining)
+
+    # Drain the queue and confirm the dispatcher skipped tombstoned tasks.
+    processor = asyncio.create_task(queue.start_processing())
+    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
+    await queue.stop()
+    await asyncio.wait_for(processor, timeout=1.0)
+
+    # Only the cancel_order and pos-other place_sl should have run.
+    assert adapter.place_stop_loss.await_count == 1
+    assert adapter.replace_sl.await_count == 0 if hasattr(adapter, "replace_sl") else True
+    assert adapter.place_take_profit.await_count == 0
+    adapter.cancel_conditional_order.assert_awaited_once()
+
+
+async def test_resolve_emergency_quantity_returns_zero_when_no_positive_value() -> None:
+    """``_resolve_emergency_quantity`` must return 0.0 (not raise) when
+    none of the conventional keys carry a positive quantity.
+
+    Defensive: the canonical SL path no longer enqueues emergency closes
+    with qty=0 (multi_tp.py skips replace_sl when current_quantity<=0),
+    but if any other caller does, we must not crash the queue worker.
+    """
+    assert OrderExecutionQueue._resolve_emergency_quantity({}) == 0.0
+    assert OrderExecutionQueue._resolve_emergency_quantity(
+        {"full_quantity": 0, "quantity": 0.0, "new_quantity": 0}
+    ) == 0.0
+    # First positive value still wins.
+    assert OrderExecutionQueue._resolve_emergency_quantity(
+        {"full_quantity": 0, "quantity": 0.42, "new_quantity": 1.0}
+    ) == pytest.approx(0.42)
+
+
+async def test_emergency_market_close_skipped_when_quantity_resolves_zero() -> None:
+    """The dispatcher skips an emergency_market_close task built with qty=0
+    rather than calling the adapter (which would either reject or close
+    nothing). Mirrors the audit-side guard added with the qty<=0 fix.
+    """
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    adapter.can_place_order.return_value = True
+
+    queue = OrderExecutionQueue(adapter=adapter, account_id="acc-emerg-zero")
+
+    processor = asyncio.create_task(queue.start_processing())
+    await queue.enqueue(
+        OrderTask(
+            priority=OrderPriority.EMERGENCY_CLOSE,
+            created_at=1.0,
+            position_id="pos-zero",
+            action="emergency_market_close",
+            params={
+                "symbol": "BTC/USDT:USDT",
+                "side": OrderSide.SELL,
+                "full_quantity": 0.0,
+                "client_order_id": "emerg-zero-1",
+            },
+        )
+    )
+    await asyncio.wait_for(queue._queue.join(), timeout=1.0)
+    await queue.stop()
+    await asyncio.wait_for(processor, timeout=1.0)
+
+    adapter.partial_close.assert_not_awaited()
 
 
 async def test_rate_limit_pause_waits_before_execution(monkeypatch: pytest.MonkeyPatch) -> None:

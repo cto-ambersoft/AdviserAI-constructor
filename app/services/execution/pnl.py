@@ -7,7 +7,8 @@ from app.schemas.exchange_trading import NormalizedBalance, NormalizedTrade, Spo
 @dataclass(slots=True)
 class _Lot:
     qty: float
-    entry_price: float
+    entry_price: float  # fee-inclusive cost basis (break-even) — drives realized/unrealized
+    entry_price_clean: float  # actual fill price — reported as average_entry_price
 
 
 def _split_symbol(symbol: str) -> tuple[str, str] | None:
@@ -82,7 +83,9 @@ def calculate_spot_pnl(
 
         if trade.side == "buy":
             effective_cost = (price * qty) + fee_quote
-            lots.append(_Lot(qty=qty, entry_price=effective_cost / qty))
+            lots.append(
+                _Lot(qty=qty, entry_price=effective_cost / qty, entry_price_clean=price)
+            )
             continue
 
         remaining_to_close = qty
@@ -114,15 +117,20 @@ def calculate_spot_pnl(
             continue
         qty = max(0.0, float(balance_map.get(asset, 0.0)))
         lots = lots_by_asset.get(asset, [])
+        # ``avg_entry`` is the reported fill price (clean); ``cost_basis_entry``
+        # is the fee-inclusive break-even that drives unrealized PnL — Binance
+        # exposes the same distinction as entryPrice vs breakEvenPrice.
         avg_entry = None
+        cost_basis_entry = None
         if lots:
             lot_qty = sum(item.qty for item in lots)
             if lot_qty > 0:
-                avg_entry = sum(item.qty * item.entry_price for item in lots) / lot_qty
+                avg_entry = sum(item.qty * item.entry_price_clean for item in lots) / lot_qty
+                cost_basis_entry = sum(item.qty * item.entry_price for item in lots) / lot_qty
         mark_price = mark_prices.get(asset)
         unrealized = 0.0
-        if qty > 0 and avg_entry is not None and mark_price is not None and mark_price > 0:
-            unrealized = (mark_price - avg_entry) * qty
+        if qty > 0 and cost_basis_entry is not None and mark_price is not None and mark_price > 0:
+            unrealized = (mark_price - cost_basis_entry) * qty
         realized = realized_by_asset.get(asset, 0.0)
         fees = fees_by_asset.get(asset, 0.0)
         row = SpotPnlAsset(

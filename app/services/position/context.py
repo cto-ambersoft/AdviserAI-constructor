@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
-import json
-import re
-from typing import Any, Optional
+from typing import Any
 
 from app.services.position.state_machine import PositionState, PositionStateMachine
 
@@ -80,7 +80,7 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
-def _to_iso_string(value: Any, default: Optional[str] = None) -> Optional[str]:
+def _to_iso_string(value: Any, default: str | None = None) -> str | None:
     if value is None:
         return default
     if isinstance(value, datetime):
@@ -191,12 +191,12 @@ class TPLevel:
     close_pct: float
     trigger_price: float
     status: str
-    exchange_order_id: Optional[str]
+    exchange_order_id: str | None
     # Deprecated string form kept for back-compat: "breakeven" / "tpN".
-    move_sl_to: Optional[str] = None
+    move_sl_to: str | None = None
     # Preferred numeric: % of profit locked on this TP fill (entry→TP interval).
     # Takes priority over move_sl_to when set.
-    sl_lock_pct: Optional[float] = None
+    sl_lock_pct: float | None = None
 
     @staticmethod
     def compute_trigger_price(
@@ -219,10 +219,10 @@ class TPLevel:
         entry_price: float,
         side: PositionSide,
         status: str = "pending",
-        exchange_order_id: Optional[str] = None,
-        move_sl_to: Optional[str] = None,
-        sl_lock_pct: Optional[float] = None,
-    ) -> "TPLevel":
+        exchange_order_id: str | None = None,
+        move_sl_to: str | None = None,
+        sl_lock_pct: float | None = None,
+    ) -> TPLevel:
         """Build TP level with computed trigger_price."""
         return cls(
             level=level,
@@ -242,7 +242,7 @@ class TPLevel:
         *,
         entry_price: float,
         side: PositionSide,
-    ) -> "TPLevel":
+    ) -> TPLevel:
         """Parse TP level from dict and compute trigger if missing."""
         level = _to_int(raw.get("level"), default=0)
         offset_pct = _to_float(raw.get("price_offset_pct"), default=0.0)
@@ -339,22 +339,31 @@ class PositionContext:
 
     # Stop Loss
     current_sl_price: float = 0.0
-    sl_exchange_order_id: Optional[str] = None
+    sl_exchange_order_id: str | None = None
     sl_type: str = "fixed"
     sl_history: list[SLHistoryEntry] = field(default_factory=list)
 
     # Take Profit
     tp_mode: str = "single"
     tp_levels: list[TPLevel] = field(default_factory=list)
-    current_tp_price: Optional[float] = None
+    current_tp_price: float | None = None
     tp_history: list[TPHistoryEntry] = field(default_factory=list)
+
+    # In-memory dispatch guard for multi-TP SL repositioning. Holds the set of
+    # ``triggered_level`` indices for which the engine has already enqueued a
+    # ``replace_sl`` task during this process's lifetime. Not persisted: after
+    # restart, ``tp_levels[i].status == "triggered"`` (restored from DB) is
+    # sufficient on its own. This second guard exists to close the concurrent
+    # re-entry window where two near-simultaneous TP-fill events would both
+    # pass the status check before the first one writes ``"triggered"``.
+    dispatched_sl_levels: set[int] = field(default_factory=set, compare=False, repr=False)
 
     # Trailing stop config
     trailing_enabled: bool = False
-    trailing_callback_rate: Optional[float] = None
-    trailing_activation_price: Optional[float] = None
-    trailing_highest_price: Optional[float] = None
-    trailing_lowest_price: Optional[float] = None
+    trailing_callback_rate: float | None = None
+    trailing_activation_price: float | None = None
+    trailing_highest_price: float | None = None
+    trailing_lowest_price: float | None = None
 
     # Breakeven config
     breakeven_enabled: bool = False
@@ -365,7 +374,16 @@ class PositionContext:
     volatility_sl_enabled: bool = False
     volatility_atr_period: int = 14
     volatility_atr_multiplier: float = 2.0
-    volatility_last_atr: Optional[float] = None
+    volatility_last_atr: float | None = None
+
+    # Volatility Kill-Switch config (W9 — AC#4 in-trade hard auto-close). Off by
+    # default; populated from the strategy's risk config. NULL params ⇒ that
+    # branch off / the detector's engine default (atr_period 14, cooldown 3s).
+    kill_switch_enabled: bool = False
+    kill_switch_atr_spike_mult: float | None = None
+    kill_switch_atr_period: int | None = None
+    kill_switch_price_move_pct: float | None = None
+    kill_switch_cooldown_seconds: int | None = None
 
     # Watchers
     active_watchers: list[WatcherConfig] = field(default_factory=list)
@@ -377,8 +395,8 @@ class PositionContext:
 
     # Timing
     opened_at: str = ""
-    closed_at: Optional[str] = None
-    last_adjusted_at: Optional[str] = None
+    closed_at: str | None = None
+    last_adjusted_at: str | None = None
 
     # PnL
     realized_pnl: float = 0.0
@@ -425,7 +443,7 @@ class PositionContext:
             self.state_machine.state = self.state
 
     @classmethod
-    def from_db_row(cls, row: dict[str, Any]) -> "PositionContext":
+    def from_db_row(cls, row: dict[str, Any]) -> PositionContext:
         """Build PositionContext from DB row-like dict with JSON columns."""
         sl_history_raw = _parse_json(row.get("sl_history_json"), default=[])
         tp_levels_raw = _parse_json(row.get("tp_levels_json"), default=[])

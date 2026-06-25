@@ -1,0 +1,132 @@
+=== BACKUP Mon Jun 22 08:54:37 UTC 2026 ===
+--- profiles.query_prompt (id7) ---
+Analyze BTC for a 60-minute auto-trading cycle. Re-evaluated hourly; reason over the NEXT 1-3 HOURS only.
+
+HOW MY ENGINE USES YOUR OUTPUT — this is LIVE capital, read carefully:
+- Execution depends on EXACTLY three fields: analysisStructured.bias, .confidence, .currentPrice.
+  Everything else (summary, keyLevels, scenarios, recommendations, indicator picks) is shown to me
+  on a card and does NOT place orders. Do not assume your price targets become my stops/take-profits.
+- bias -> direction: BULLISH = open LONG, BEARISH = open SHORT, NEUTRAL = no new trade.
+- Position size is FIXED and identical on every trade. Confidence does NOT change size. Confidence is
+  ONLY (a) the gate that lets a trade open and (b) the trigger that reverses an open position.
+  Never inflate confidence to "bet bigger" — it cannot.
+- OPEN gate: a new position opens when confidence >= 0.65. Below 0.65 -> return NEUTRAL (no trade).
+- REVERSAL gate: if I already hold the OPPOSITE side, confidence >= 0.80 flips it IMMEDIATELY
+  (closes at market and reverses). Between 0.65 and 0.79 against an open position it takes TWO
+  consecutive same-direction reports to flip. Reserve >= 0.80 for genuine high-conviction reversals:
+  an inflated 0.80 yanks a working position at market and is expensive.
+- Exits are fully automated by a fixed 1:2 multi-TP ladder (partial take-profits near +0.75% / +1.5%
+  / +2.0%, initial stop near -1%, stop ratchets toward breakeven as TPs fill). You do NOT set exits.
+  Once the first TP fills, the position ignores new signals and rides the ladder to completion.
+- While a position is open and you return NEUTRAL, the position is HELD and exits only via its
+  ladder/stop. NEUTRAL never closes a position.
+
+TECHNICAL READ — use ONLY the indicator data present in the provided sections; never fabricate values:
+- The price snapshot gives you: current price, moving averages (7/30/90/200-day), MA ALIGNMENT
+  (BULLISH/BEARISH/MIXED), a TREND SIGNAL (STRONG_UPTREND/UPTREND/RANGING/DOWNTREND/STRONG_DOWNTREND),
+  and DISTANCE FROM THE 200-DAY MA (%). Use these as the trend/regime backdrop.
+- The ML TECHNICAL SIGNAL (BUY/SELL/HOLD + its own confidence) is a model built on RSI/EMA/MACD-type
+  features. Treat it as your primary near-term (1-3h) technical read. You receive its verdict, not the
+  raw RSI/EMA numbers — so reason from the verdict, do NOT state specific RSI or EMA values.
+- CONFLUENCE drives confidence: when MA alignment + trend signal + the ML tech signal agree with the
+  on-chain / derivatives / sentiment evidence, that is the ">= 2 independent sources" needed for 0.65+
+  (and only a strong, break-level-backed alignment justifies >= 0.80).
+- If the MA structure and the ML tech signal CONTRADICT each other or the other sources, cut confidence
+  and prefer NEUTRAL.
+- CRITICAL: Do NOT invent indicator numbers (RSI levels, EMA60/EMA200 values, MACD readings) that are
+  not in the provided data. On live capital, fabricated technicals are worse than none.
+
+CONFIDENCE CALIBRATION — be honest; confidence is the true probability the stated direction is the
+MODAL outcome over the next 1-3h:
+- 0.80-1.00  HIGH CONVICTION. >=2 independent sources (price/MA + ML tech, on-chain, derivatives,
+             sentiment, macro) agree AND a concrete near-term break level/catalyst exists AND no strong
+             counter-signal. Only this band reverses an open opposite position — use it sparingly.
+- 0.65-0.79  SOLID LEAN. >=2 sources lean the same way; minor disagreement acceptable. Opens a trade.
+- 0.50-0.64  WEAK / NO TRADEABLE EDGE -> return NEUTRAL.
+- < 0.50     NO EDGE -> return NEUTRAL.
+
+BIAS POLICY:
+- Commit to a directional bias whenever there is a real, defensible lean backed by >=2 sources — do not
+  hide behind NEUTRAL out of caution.
+- Return NEUTRAL when: (a) sources are flat/range-bound, OR (b) sources of comparable weight point in
+  OPPOSITE directions with no tiebreaker, OR (c) the lean is real but below 0.65, OR (d) currentPrice
+  cannot be established.
+- Stale data (>6h) is NOT by itself a reason for NEUTRAL — lower confidence ~0.05 and keep the live bias.
+
+BIAS-CONFIDENCE CONSISTENCY:
+- bias=BULLISH means the bullish 1-3h scenario is more likely than bearish AND than flat (mirror for
+  BEARISH). If flat is the modal outcome, bias is NEUTRAL.
+- Scenarios[Bullish].probability ~= confidence when BULLISH; Scenarios[Bearish].probability ~=
+  1 - confidence. Mirror for BEARISH. For NEUTRAL split ~0.5/0.5.
+
+currentPrice INTEGRITY (critical):
+- Take currentPrice ONLY from the CURRENT PRICE DATA / HISTORICAL PRICE SNAPSHOT section of this prompt.
+  Never invent it. If no price section is present, set currentPrice=0, bias=NEUTRAL, confidence=0.
+
+USER-FACING CARD (no effect on orders, but keep it credible and consistent):
+- Produce keyLevels, scenarios, and recommendations.{long,short}Entry realistic for a 1-3h move
+  (targets ~ +/-0.75-2% of price, stop near -1%) and consistent with the bias/confidence you returned.
+- When you list recommended indicators, pick a set consistent with your bias (trend-following set for a
+  directional call: EMA/MACD/ADX/VWAP; mean-reversion set when ranging: RSI/Stoch RSI/Bollinger). These
+  are advisory for the human reviewer and do not change my orders.
+
+
+--- auto_trade_configs (id13) ---
+-[ RECORD 1 ]-------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+id                        | 13
+user_id                   | 1
+profile_id                | 7
+account_id                | 17
+enabled                   | t
+is_running                | f
+position_size_usdt        | 10000
+leverage                  | 1
+min_confidence_pct        | 65
+fast_close_confidence_pct | 80
+confirm_reports_required  | 2
+risk_mode                 | 1:2
+sl_pct                    | 1
+tp_pct                    | 2
+last_started_at           | 2026-06-18 12:38:04.694749+00
+last_stopped_at           | 2026-06-20 06:57:26.246418+00
+created_at                | 2026-05-12 12:10:06.540721+00
+updated_at                | 2026-06-20 06:57:26.240738+00
+strategy_profile_json     | {"sl_mode": "fixed", "sl_value": 1.0, "tp_mode": "multi", "tp_value": null, "tp_levels": [{"price_offset_pct": 0.75, "close_pct": 25.0, "move_sl_to": null, "sl_lock_pct": -50.0}, {"price_offset_pct": 1.5, "close_pct": 50.0, "move_sl_to": null, "sl_lock_pct": 0.0}, {"price_offset_pct": 2.0, "close_pct": 25.0, "move_sl_to": null, "sl_lock_pct": null}], "trailing_enabled": false, "trailing_callback_rate": 1.0, "breakeven_enabled": false, "breakeven_trigger_rr": 1.0, "volatility_sl_enabled": false, "volatility_atr_period": 14, "volatility_atr_multiplier": 2.0, "watchers": [], "adjustment_priority": ["watcher", "trailing", "breakeven", "volatility"], "max_position_pct": 100.0, "allow_sl_widen": false}
+ai_overlay_config_json    | 
+strategy_name             | 
+lifecycle_stage           | live
+sandbox_entered_at        | 
+attached_forecast_id      | 
+
+--- auto_trade_risk_configs (config_id13) ---
+-[ RECORD 1 ]-----------------+------------------------------
+config_id                     | 13
+enabled                       | t
+daily_loss_limit_usdt         | 
+daily_loss_limit_pct          | 
+max_open_positions            | 
+max_open_positions_per_symbol | 
+exposure_cap_usdt             | 
+leverage_ceiling              | 
+conflicting_signal_policy     | off
+created_at                    | 2026-06-15 22:15:23.101787+00
+updated_at                    | 2026-06-15 22:15:23.101787+00
+kpi_guard_enabled             | f
+kpi_guard_max_dd_pct          | 
+kpi_guard_max_daily_loss_usdt | 
+kpi_guard_max_daily_loss_pct  | 
+kpi_guard_min_win_rate_pct    | 
+kpi_guard_min_trades          | 
+kill_switch_enabled           | f
+kill_switch_atr_spike_mult    | 
+kill_switch_atr_period        | 
+kill_switch_price_move_pct    | 
+kill_switch_cooldown_seconds  | 
+anomaly_detection_enabled     | f
+anomaly_z_threshold           | 
+anomaly_window                | 
+promote_min_win_rate_pct      | 
+promote_max_dd_pct            | 
+promote_min_trades            | 
+promote_min_sandbox_days      | 
+

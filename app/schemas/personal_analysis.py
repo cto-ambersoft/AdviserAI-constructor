@@ -11,6 +11,7 @@ PERSONAL_ANALYSIS_AGENT_NAMES = (
     "researchQuantitative",
     "newsSearch",
     "techModelSignal",
+    "riskControl",
     "binanceRealtime",
 )
 
@@ -200,3 +201,21 @@ class PersonalAnalysisHistoryRead(BaseModel):
     @classmethod
     def normalize_analysis_data(cls, value: Any) -> Any:
         return normalize_analysis_payload(value)
+
+
+class AgentFreshnessRead(BaseModel):
+    """Current data-freshness snapshot for one (profile, agent) (W8 — T3.3)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    profile_id: int
+    symbol: str
+    agent_key: str
+    last_data_at: datetime | None
+    age_minutes: int | None
+    is_fresh: bool
+    checked_at: datetime
+
+
+class AgentFreshnessResponse(BaseModel):
+    statuses: list[AgentFreshnessRead] = Field(default_factory=list)

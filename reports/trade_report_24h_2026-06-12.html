@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Отчёт по сделкам за 24ч — реальный счёт Binance (до 2026-06-12 06:10 UTC)</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --line:#2a2f3a;
+    --txt:#e6e9ef; --muted:#9aa3b2; --accent:#5b9dff;
+    --green:#36c98a; --green-bg:rgba(54,201,138,.12);
+    --red:#f2607a; --red-bg:rgba(242,96,122,.12);
+    --amber:#e9b949; --amber-bg:rgba(233,185,73,.12);
+    --chip:#232834;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 64px}
+  h1{font-size:24px;margin:0 0 4px;letter-spacing:.2px}
+  h2{font-size:18px;margin:36px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;margin:22px 0 10px;color:var(--txt)}
+  .sub{color:var(--muted);margin:0 0 2px}
+  .metabar{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 8px}
+  .pill{background:var(--chip);border:1px solid var(--line);color:var(--muted);
+    border-radius:999px;padding:3px 11px;font-size:12px}
+  .pill.real{background:rgba(91,157,255,.14);color:var(--accent);border-color:rgba(91,157,255,.35)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin:20px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+  .card .v{font-size:22px;font-weight:650;margin-top:6px;font-variant-numeric:tabular-nums}
+  .card .v small{font-size:13px;font-weight:500;color:var(--muted)}
+  .pos{color:var(--green)} .neg{color:var(--red)} .neu{color:var(--amber)}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-variant-numeric:tabular-nums}
+  th,td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  thead th{color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.4px;
+    border-bottom:1px solid var(--line);background:var(--panel2)}
+  tbody tr:hover{background:rgba(255,255,255,.02)}
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+  .tablewrap table{margin:0}
+  .tag{display:inline-block;border-radius:6px;padding:1px 8px;font-size:11.5px;font-weight:600;letter-spacing:.3px}
+  .tag.long{background:var(--green-bg);color:var(--green)}
+  .tag.short{background:var(--red-bg);color:var(--red)}
+  .tag.real{background:rgba(91,157,255,.14);color:var(--accent);border:1px solid rgba(91,157,255,.3)}
+  .tag.open{background:var(--amber-bg);color:var(--amber)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+  dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:6px 14px}
+  dl dt{color:var(--muted)} dl dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+  .timeline{list-style:none;margin:6px 0 0;padding:0}
+  .timeline li{padding:8px 0;border-bottom:1px dashed var(--line);display:flex;justify-content:space-between;gap:12px}
+  .timeline li:last-child{border-bottom:none}
+  .timeline .t{color:var(--muted);font-variant-numeric:tabular-nums}
+  .note{color:var(--muted);font-size:12.5px}
+  .legend{font-size:12.5px;color:var(--muted)}
+  .legend b{color:var(--txt)}
+  code{background:var(--chip);padding:1px 6px;border-radius:5px;font-size:12.5px}
+  .footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+  .barrow{display:flex;align-items:center;gap:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <p class="sub">Adviser-AI · авто-трейд (Binance USDⓈ-M фьючерсы) · только РЕАЛЬНЫЙ счёт</p>
+  <h1>Отчёт по сделкам за 24 часа — реальный счёт Binance</h1>
+  <div class="metabar">
+    <span class="pill real">Счёт: REAL · Binance · account 17</span>
+    <span class="pill">Окно: 2026-06-11 06:10 → 2026-06-12 06:10 UTC</span>
+    <span class="pill">Время — UTC (локальное = UTC+3)</span>
+    <span class="pill">Символ: BTC/USDT:USDT</span>
+    <span class="pill">Источник: prod Postgres + Binance API (read-only)</span>
+    <span class="pill">Плечо: 1×</span>
+  </div>
+
+  <!-- KPI -->
+  <div class="cards">
+    <div class="card">
+      <div class="k">Позиция</div>
+      <div class="v">#274 <small>· LONG multi-TP</small></div>
+    </div>
+    <div class="card">
+      <div class="k">Реализ. PnL (брутто)</div>
+      <div class="v pos">+3.34 <small>USDT</small></div>
+    </div>
+    <div class="card">
+      <div class="k">Нетто реализовано</div>
+      <div class="v pos">+2.98 <small>USDT</small></div>
+    </div>
+    <div class="card">
+      <div class="k">Плавающий*</div>
+      <div class="v neu">+0.71 <small>USDT</small></div>
+    </div>
+    <div class="card">
+      <div class="k">Комиссия</div>
+      <div class="v">−0.35 <small>USDT</small></div>
+    </div>
+    <div class="card">
+      <div class="k">Фандинг</div>
+      <div class="v">−0.0095 <small>USDT</small></div>
+    </div>
+  </div>
+  <p class="note">За окно на реальном счёте открыта одна позиция — #274. «Нетто реализовано» = реализованный PnL по закрытым частям − комиссия − фандинг. <b>* «Плавающий»</b> — нереализованный PnL по открытому остатку 0.003 BTC (по mark 63 151 на 2026-06-12 ~06:25 UTC, сверено с Binance); меняется с рынком, не зафиксирован.</p>
+
+  <!-- ───────────────── POSITION 274 ───────────────── -->
+  <h2>Позиция #274</h2>
+
+  <div class="panel">
+    <div class="barrow" style="justify-content:space-between;flex-wrap:wrap">
+      <h3 style="margin:0">BTC/USDT <span class="tag long">LONG</span> <span class="tag real">REAL</span> <span class="tag open">ОТКРЫТА (частично)</span></h3>
+      <div class="note">multi-TP · открыта 2026-06-11 08:34:56 UTC</div>
+    </div>
+
+    <div class="grid2" style="margin-top:14px">
+      <div>
+        <h3>Параметры входа</h3>
+        <dl>
+          <dt>Вход (6 филлов)</dt><dd>62 913.3</dd>
+          <dt>Объём</dt><dd>0.007 BTC (≈ 440.4 USDT)</dd>
+          <dt>Размер по конфигу</dt><dd>500 USDT</dd>
+          <dt>Уверенность сигнала</dt><dd>70 %</dd>
+          <dt>SL начальный</dt><dd>≈ 62 288 (−1.0 %)</dd>
+          <dt>SL текущий</dt><dd class="pos">62 677.4 ▲ (перенесён)</dd>
+        </dl>
+      </div>
+      <div>
+        <h3>Лесенка TP (mode = multi)</h3>
+        <dl>
+          <dt>TP1 · 63 385.15</dt><dd>25 % · SL→reduce-risk (−50 %) · <span class="pos">filled</span></dd>
+          <dt>TP2 · 63 857.00</dt><dd>50 % · SL→breakeven (0 %) · <span class="pos">filled</span></dd>
+          <dt>TP3 · 64 171.57</dt><dd>25 % · SL без сдвига · <span class="neu">open</span></dd>
+        </dl>
+      </div>
+    </div>
+
+    <h3>Как отработала</h3>
+    <ul class="timeline">
+      <li><span><span class="t">08:34:55</span> &nbsp;Вход LONG 0.007 @ 62 913.3 (6 филлов, taker)</span><span class="note">комиссия −0.2202</span></li>
+      <li><span><span class="t">17:32:51</span> &nbsp;<b>TP1</b> — продано 0.001 @ 63 375.7</span><span class="pos">+0.4624</span></li>
+      <li><span><span class="t">19:30:56</span> &nbsp;<b>TP2</b> — продано 0.003 @ 63 871.9</span><span class="pos">+2.8758</span></li>
+      <li><span><span class="t">сейчас</span> &nbsp;Остаток <b>0.003 BTC</b> открыт, SL 62 677.4 live · TP3 64 171.6 resting (mark 63 151)</span><span class="neu">плавающий +0.71</span></li>
+    </ul>
+    <p class="note">⚠️ Оба TP пришли как <code>origin=external</code> — то есть user-data WebSocket их пропустил, а REST-доводчик подхватил (та самая дыра реального счёта). Перенос SL после TP отработал через REST-контур: SL переехал 62 288 → 62 677.4. Нюанс: встал на уровень TP1 (reduce-risk), а не TP2 (breakeven 62 913) — из-за гонки коалесинга очереди ордеров (разница ≈ $0.71 на остатке; вынесено в отдельную задачу).</p>
+
+    <h3>Экономика (реализовано на сейчас)</h3>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Статья</th><th>USDT</th><th>Комментарий</th></tr></thead>
+        <tbody>
+          <tr><td>Реализованный PnL (TP1+TP2)</td><td class="pos">+3.3382</td><td class="note">0.001@63 375.7 + 0.003@63 871.9 vs вход 62 913.3</td></tr>
+          <tr><td>Комиссия (вход + 2 выхода)</td><td class="neg">−0.3477</td><td class="note">taker ≈ 0.05 %</td></tr>
+          <tr><td>Фандинг (16:00 −0.0120, 00:00 +0.0025)</td><td class="neg">−0.0095</td><td class="note">2 начисления за время удержания</td></tr>
+          <tr style="font-weight:650"><td>Нетто реализовано</td><td class="pos">+2.9810</td><td class="note">по закрытым 0.004 BTC</td></tr>
+          <tr><td>Плавающий PnL (остаток 0.003)</td><td class="neu">+0.71</td><td class="note">Binance unrealized @ mark 63 151 (06:25 UTC) · плавает</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h3>Все филлы по 274 (биржевой реестр = Binance userTrades)</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Время UTC</th><th>Сторона</th><th>Кол-во BTC</th><th>Цена</th><th>Реализ. PnL</th><th>Комиссия</th><th>Origin</th></tr></thead>
+      <tbody>
+        <tr><td>06-11 08:34:55</td><td>buy</td><td>0.001 ×5 + 0.002</td><td>62 913.3</td><td>0.0000</td><td class="neg">−0.2202</td><td>platform</td></tr>
+        <tr><td>06-11 17:32:51</td><td>sell (TP1)</td><td>0.001</td><td>63 375.7</td><td class="pos">+0.4624</td><td class="neg">−0.0317</td><td>external</td></tr>
+        <tr><td>06-11 19:30:56</td><td>sell (TP2)</td><td>0.003</td><td>63 871.9</td><td class="pos">+2.8758</td><td class="neg">−0.0958</td><td>external</td></tr>
+      </tbody>
+      <tfoot>
+        <tr style="font-weight:650;border-top:2px solid var(--line)">
+          <td colspan="4">Итого (закрыто 0.004 BTC)</td><td class="pos">+3.3382</td><td class="neg">−0.3477</td><td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <!-- ───────────────── VERIFY ───────────────── -->
+  <h2>✅ Сверка с биржей + ⚠️ ошибки учёта в сервисе</h2>
+  <p class="note">Позиция 274 сверена <b>напрямую с Binance</b> (live <code>fapi</code>, ключ из <code>.env</code>, запрос с сервера — read-only): <code>fetch_my_trades</code> + <code>fetch_funding_history</code> + <code>fetch_positions</code> + <code>openAlgoOrders</code>. Реальные деньги сходятся точно.</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Показатель</th><th>Binance (истина)</th><th>В этом отчёте</th><th>Что считает наш сервис (UI)</th></tr></thead>
+      <tbody>
+        <tr><td>Реализованный PnL</td><td class="pos">+3.3382</td><td class="pos">+3.3382 ✓</td><td class="neg">0.00 ✗</td></tr>
+        <tr><td>Комиссия</td><td>0.3477</td><td>0.3477 ✓</td><td class="neg">0.2202 ✗ <span class="note">(только вход)</span></td></tr>
+        <tr><td>Фандинг</td><td>−0.0095</td><td>−0.0095 ✓</td><td class="neg">0.00 ✗</td></tr>
+        <tr style="font-weight:650"><td>Нетто реализовано</td><td class="pos">+2.981</td><td class="pos">+2.981 ✓</td><td class="neg">−0.22 ✗</td></tr>
+        <tr><td>Плавающий (остаток 0.003)</td><td class="neu">+0.7142</td><td class="neu">+0.71 ✓</td><td class="note">— (живой)</td></tr>
+        <tr><td>SL на бирже</td><td>STOP_MARKET 62 677.4 · live</td><td>62 677.4 ✓</td><td>62 677.4 ✓</td></tr>
+        <tr><td>TP3 на бирже</td><td>TAKE_PROFIT 64 171.6 · resting</td><td>open ✓</td><td>open ✓</td></tr>
+        <tr><td>Открытый остаток</td><td>0.003 BTC @ entry 62 913.3</td><td>0.003 ✓</td><td>0.003 ✓</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note">Пустой <code>fetch_open_orders</code> — это норма: SL/TP у нас алго-ордера (conditional), они на отдельном эндпоинте <code>openAlgoOrders</code>, где и подтвердились.</p>
+
+  <h3>⚠️ Где сервис считает неправильно (UI показывает 274 как убыток вместо прибыли)</h3>
+  <div class="panel">
+    <p><b>Баг 1 — реализованный PnL позиции = 0.</b><br>
+    <span class="legend"><code>build_position_pnl_snapshot → _position_ledger_breakdown</code> (<code>service.py:2546 / 5269</code>) берёт филлы по <code>auto_trade_position_id == position.id</code>. Но <b>все выходные филлы (TP/SL) приходят с <code>origin='external'</code> и <code>auto_trade_position_id = NULL</code></b> — user-data WS их пропустил, а REST-синк не привязал к позиции. К 274 «привязаны» только 6 входных филлов (realized_pnl=0). Сервис выдаёт <b>gross_realized = 0, net = −0.22 USDT</b> и показывает позицию как мелкий минус, тогда как по бирже это <b>+2.98 прибыли</b>. На реальном счёте это системно: практически все PnL-несущие филлы — <code>external</code> и не привязаны ни к одной позиции.</span></p>
+    <p><b>Баг 2 — фандинг позиции = 0 (несовпадение формата символа).</b><br>
+    <span class="legend"><code>sum_funding</code> (<code>income_sync.py</code>) фильтрует <code>income_ledger.symbol == position.symbol</code>, где <code>position.symbol = "BTC/USDT:USDT"</code> (ccxt-формат), а реестр доходов хранит символ как <code>"BTCUSDT"</code> (нативный Binance). Совпадений нет → фандинг по позиции всегда <b>0</b>. Реальный фандинг 274 = −0.0095 USDT.</span></p>
+    <p class="note">Числа в этом отчёте взяты <b>не</b> из багового сервисного метода, а посчитаны напрямую из биржевого реестра по связке <b>символ + время</b> и сверены с Binance — поэтому корректны. Баги бьют по <b>отображению PnL позиции в UI/API</b>. Отдельно стоит проверить, не ключуются ли так же риск-гард / дневной лимит убытка (если да — риск-решения могут опираться на заниженный PnL).</p>
+  </div>
+
+  <!-- ───────────────── LEGEND ───────────────── -->
+  <h2>Методология и примечания</h2>
+  <div class="panel legend">
+    <p><b>Область отчёта:</b> только реальный счёт Binance (account 17). Демо-счёт (account 16) исключён по запросу.</p>
+    <p><b>Источники данных (всё read-only):</b> позиция — <code>auto_trade_positions</code>; филлы, комиссии, реализованный PnL — <code>exchange_trade_ledger</code> (<code>realized_pnl</code>, <code>fee_cost</code>); фандинг — <code>exchange_income_ledger</code> (<code>income_type='FUNDING_FEE'</code>). Дополнительно — прямой read-only запрос к Binance live <code>fapi</code> для сверки.</p>
+    <p><b>Реализованный PnL</b> — сумма <code>realized_pnl</code> по закрывающим филлам (брутто, до комиссии). <b>Комиссия</b> — сумма taker-fee по всем филлам (вход + выходы). <b>Фандинг</b> — по Binance <code>income</code> со знаком: отрицательный = уплачено, положительный = получено; начисляется каждые 8 ч (00:00 / 08:00 / 16:00 UTC) на открытую позицию. <b>Нетто</b> = realized − commission − funding.</p>
+    <p><b>«external» филлы:</b> TP/SL-исполнения по 274 пришли из биржи мимо платформенного учёта (user-data WebSocket их пропустил) и доведены REST-синком. Реализованный PnL и комиссия по ним взяты из биржевого реестра и учтены (см. раздел «ошибки учёта» — сервис их к позиции не привязывает).</p>
+    <p><b>Открытый остаток (274):</b> «нетто» — только по закрытым 0.004 BTC. Плавающий PnL по остатку 0.003 BTC дан live-значением Binance по mark-цене и не зафиксирован.</p>
+    <p><b>Контекст по 274:</b> первая позиция реального счёта после деплоя фикса переноса SL при срабатывании TP на «глухом» WS. Перенос SL отработал (REST-контур), позиция всё время оставалась под защитой стоп-лосса.</p>
+  </div>
+
+  <div class="footer">
+    Сгенерировано только чтением: боевая БД (<code>ambercore-server</code> · <code>postgres</code> · <code>trade_platform</code>) + прямой Binance <code>fapi</code> (read-only).
+    Торговая логика не изменялась. Числа в USDT. · 2026-06-12
+  </div>
+
+</div>
+</body>
+</html>

@@ -8,6 +8,7 @@ from app.schemas.exchange_trading import (
     ExchangeName,
     NormalizedBalance,
     NormalizedFuturesPosition,
+    NormalizedIncome,
     NormalizedOrder,
     NormalizedTrade,
     OrderSide,
@@ -86,6 +87,18 @@ class CexAdapter(Protocol):
         limit: int = 200,
         cursor: str | None = None,
     ) -> tuple[list[NormalizedTrade], str | None]: ...
+
+    async def fetch_futures_income(
+        self,
+        *,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[NormalizedIncome]: ...
+
+    async def fetch_mark_prices(
+        self, *, assets: list[str], quote: str = "USDT"
+    ) -> dict[str, float]: ...
 
     async def fetch_spot_positions_view(
         self,

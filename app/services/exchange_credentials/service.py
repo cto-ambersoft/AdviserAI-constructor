@@ -1,3 +1,4 @@
+import hashlib
 from typing import cast
 
 from sqlalchemy import select
@@ -16,6 +17,20 @@ from app.schemas.exchange_trading import ExchangeMode, ExchangeName
 from app.services.execution.base import ExchangeCredentials
 from app.services.execution.factory import create_cex_adapter
 from app.services.secrets import SecretsService
+
+
+def _hash_api_key(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+class DuplicateApiKeyError(ValueError):
+    """Raised when a user tries to register the same physical api_key twice.
+
+    Two ``ExchangeCredential`` rows pointing at the same exchange sub-account
+    would undo the per-credential isolation that W7 multi-strategy support
+    relies on (signals from two strategies would land on the same balance
+    and fight for the same physical position).
+    """
 
 
 class ExchangeCredentialsService:
@@ -38,6 +53,21 @@ class ExchangeCredentialsService:
     ) -> ExchangeAccountRead:
         exchange_name = validate_exchange_name(payload.exchange_name)
         mode = validate_mode(payload.mode)
+        api_key_hash = _hash_api_key(payload.api_key)
+        # W7: reject the same physical sub-account being registered twice
+        # (e.g. two different account_labels pointing at the same key).
+        existing = await session.scalar(
+            select(ExchangeCredential).where(
+                ExchangeCredential.user_id == user_id,
+                ExchangeCredential.api_key_hash == api_key_hash,
+            )
+        )
+        if existing is not None:
+            raise DuplicateApiKeyError(
+                "This API key is already registered under another account label "
+                f"({existing.account_label!r} on {existing.exchange_name}). "
+                "Each strategy must run on its own exchange sub-account."
+            )
         encrypted = self._secrets.encrypt_credentials(
             api_key=payload.api_key,
             api_secret=payload.api_secret,
@@ -55,12 +85,21 @@ class ExchangeCredentialsService:
                 if encrypted["encrypted_passphrase"]
                 else None
             ),
+            api_key_hash=api_key_hash,
         )
         session.add(row)
         try:
             await session.commit()
         except IntegrityError as exc:
             await session.rollback()
+            # Hash UQ violation is also possible if two concurrent inserts
+            # race past the explicit check above.
+            message = str(exc.orig).lower() if exc.orig is not None else str(exc).lower()
+            if "api_key_hash" in message:
+                raise DuplicateApiKeyError(
+                    "This API key is already registered. Each strategy must run "
+                    "on its own exchange sub-account."
+                ) from exc
             raise ValueError("Account with the same exchange and label already exists.") from exc
         await session.refresh(row)
         return ExchangeAccountRead.model_validate(row)
@@ -91,8 +130,9 @@ class ExchangeCredentialsService:
                 encrypted_api_secret=row.encrypted_api_secret,
                 encrypted_passphrase=row.encrypted_passphrase,
             )
+            new_api_key = payload.api_key or str(decrypted["api_key"])
             encrypted = self._secrets.encrypt_credentials(
-                api_key=payload.api_key or str(decrypted["api_key"]),
+                api_key=new_api_key,
                 api_secret=payload.api_secret or str(decrypted["api_secret"]),
                 passphrase=payload.passphrase
                 if payload.passphrase is not None
@@ -105,11 +145,34 @@ class ExchangeCredentialsService:
                 if encrypted["encrypted_passphrase"]
                 else None
             )
+            # W7: keep api_key_hash in sync so the UQ catches a rotation
+            # that accidentally collides with another credential.
+            new_hash = _hash_api_key(new_api_key)
+            if new_hash != row.api_key_hash:
+                existing = await session.scalar(
+                    select(ExchangeCredential).where(
+                        ExchangeCredential.user_id == user_id,
+                        ExchangeCredential.api_key_hash == new_hash,
+                        ExchangeCredential.id != row.id,
+                    )
+                )
+                if existing is not None:
+                    raise DuplicateApiKeyError(
+                        "This API key is already registered under another account "
+                        f"label ({existing.account_label!r})."
+                    )
+                row.api_key_hash = new_hash
 
         try:
             await session.commit()
         except IntegrityError as exc:
             await session.rollback()
+            message = str(exc.orig).lower() if exc.orig is not None else str(exc).lower()
+            if "api_key_hash" in message:
+                raise DuplicateApiKeyError(
+                    "This API key is already registered. Each strategy must run "
+                    "on its own exchange sub-account."
+                ) from exc
             raise ValueError("Account with the same exchange and label already exists.") from exc
         await session.refresh(row)
         return ExchangeAccountRead.model_validate(row)

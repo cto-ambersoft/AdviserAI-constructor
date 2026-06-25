@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 
+from app.api.deps import CurrentAdminUser, RequireStepUp
 from app.core.config import get_settings
 from app.services.backtesting.artifacts import (
     guess_media_type,
@@ -140,8 +141,13 @@ async def suggest_agent_weights(ai_config_id: str) -> Any:
 @router.post("/agent-weights/suggestions/{ai_config_id}/apply")
 async def apply_agent_weight_suggestion(
     ai_config_id: str,
+    current_user: RequireStepUp,
+    _admin: CurrentAdminUser,
     payload: dict[str, Any] = Body(default_factory=dict),
 ) -> Any:
+    # T17 (W12f) + review C2: applying rebinds the live AiConfig weights (T9) and
+    # shifts ai_trend (T11) on a SHARED config (no per-user ownership), so it is an
+    # ADMIN action gated by a fresh 2FA step-up — not exposed to every trader.
     return await _core_request(
         "POST",
         f"/api/v1/agent-weights/suggestions/{ai_config_id}/apply",

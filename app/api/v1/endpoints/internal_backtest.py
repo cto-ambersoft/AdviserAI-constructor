@@ -1,3 +1,4 @@
+import hmac
 import math
 from typing import Any, cast
 
@@ -25,7 +26,7 @@ def _assert_internal_key(raw_key: str | None) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Internal API key is not configured.",
         )
-    if raw_key != expected:
+    if not hmac.compare_digest(raw_key or "", expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid internal API key.",

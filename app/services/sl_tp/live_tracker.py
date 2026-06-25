@@ -29,9 +29,11 @@ from typing import Any
 import pandas as pd
 import pandas_ta as ta
 
-from app.services.position.context import PositionContext
+from app.services.exchange.adapter import OrderSide
+from app.services.position.context import PositionContext, PositionSide
 from app.services.position.order_queue import OrderExecutionQueue, OrderPriority, OrderTask
 from app.services.position.state_machine import PositionState
+from app.services.sl_tp.kill_switch import KillSwitchSignal, detect_volatility_spike
 from app.services.sl_tp.pipeline import SLAdjustmentPipeline
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,10 @@ QueueResolver = Callable[[PositionContext], Awaitable[OrderExecutionQueue]]
 ClientOrderIdFactory = Callable[[str, str], str]
 PositionPersister = Callable[[PositionContext], Awaitable[None]]
 TimeSource = Callable[[], float]
+# Hands a tripped Volatility Kill-Switch off to a session-backed close (the
+# service). Injected by the WS-manager wiring; ``None`` ⇒ the kill-switch is a
+# no-op (the realtime SL path is byte-for-byte unchanged).
+KillSwitchHandler = Callable[[PositionContext, KillSwitchSignal], Awaitable[None]]
 
 
 class RealtimeSLAdjuster:
@@ -59,6 +65,7 @@ class RealtimeSLAdjuster:
         buffer_bars: int = DEFAULT_BUFFER_BARS,
         throttle_seconds: float = DEFAULT_THROTTLE_SECONDS,
         time_source: TimeSource = time.time,
+        kill_switch_handler: KillSwitchHandler | None = None,
     ) -> None:
         if buffer_bars <= 0:
             raise ValueError("buffer_bars must be positive")
@@ -71,8 +78,14 @@ class RealtimeSLAdjuster:
         self._buffer_bars = buffer_bars
         self._throttle_seconds = float(throttle_seconds)
         self._now = time_source
+        self._kill_switch_handler = kill_switch_handler
         self._buffer: list[dict[str, Any]] = []
         self._last_adjustment_at: dict[str, float] = {}
+        self._last_kill_switch_at: dict[str, float] = {}
+        # Per-tick ATR memo (review S5): the SL volatility eval and the kill-switch
+        # share the ATR series for a given period within one tick. Invalidated by
+        # update_buffer (the only buffer mutator).
+        self._atr_cache: dict[int, pd.Series | None] = {}
 
     # ────────────────────────── public API ────────────────────────────────
 
@@ -84,6 +97,16 @@ class RealtimeSLAdjuster:
             or position.breakeven_enabled
             or position.volatility_sl_enabled
         )
+
+    @staticmethod
+    def needs_realtime_monitoring(position: PositionContext) -> bool:
+        """Return True iff the realtime tick must run for this position.
+
+        Broader than ``needs_pipeline``: a position with *only* the Volatility
+        Kill-Switch enabled (no SL rules) still needs an adjuster + ``on_tick`` so
+        the spike detector runs — otherwise the kill-switch would never fire.
+        """
+        return RealtimeSLAdjuster.needs_pipeline(position) or bool(position.kill_switch_enabled)
 
     @property
     def buffer(self) -> list[dict[str, Any]]:
@@ -109,17 +132,36 @@ class RealtimeSLAdjuster:
         if overflow > 0:
             del self._buffer[:overflow]
 
+        self._atr_cache.clear()  # buffer changed ⇒ ATR memo is stale (review S5)
         return bar
+
+    def _atr_series(self, period: int) -> pd.Series | None:
+        """Dropna'd ATR series over the current buffer, memoized per tick.
+
+        The memo (cleared by ``update_buffer``) means multiple consumers in one
+        tick — the SL volatility eval and the kill-switch — invoke ``ta.atr`` only
+        once per period (review S5). ``None`` when the buffer is too short / empty.
+        """
+        if period <= 0 or len(self._buffer) < period + 1:
+            return None
+        if period in self._atr_cache:
+            return self._atr_cache[period]
+        df = pd.DataFrame(self._buffer)
+        atr = ta.atr(df["high"], df["low"], df["close"], length=period)
+        series: pd.Series | None = None
+        if atr is not None and not atr.empty:
+            atr = atr.dropna()
+            if not atr.empty:
+                series = atr
+        self._atr_cache[period] = series
+        return series
 
     def compute_atr(self, period: int) -> float | None:
         """Return the most recent ATR value or None if the buffer is too short."""
-        if period <= 0 or len(self._buffer) < period + 1:
+        series = self._atr_series(period)
+        if series is None:
             return None
-        df = pd.DataFrame(self._buffer)
-        atr = ta.atr(df["high"], df["low"], df["close"], length=period)
-        if atr is None or atr.empty:
-            return None
-        last = float(atr.iloc[-1])
+        last = float(series.iloc[-1])
         if math.isnan(last):
             return None
         return last
@@ -127,6 +169,7 @@ class RealtimeSLAdjuster:
     def discard_position(self, position_id: str) -> None:
         """Drop throttle bookkeeping for a position that is no longer tracked."""
         self._last_adjustment_at.pop(position_id, None)
+        self._last_kill_switch_at.pop(position_id, None)
 
     async def on_tick(
         self,
@@ -141,8 +184,14 @@ class RealtimeSLAdjuster:
         if current_price <= 0:
             return []
 
+        # In-trade Volatility Kill-Switch runs BEFORE the SL pipeline: a confirmed
+        # spike flattens the position outright rather than merely tightening its SL.
+        killed = await self._check_kill_switch(bar, positions)
+
         adjusted: list[str] = []
         for position in positions:
+            if position.position_id in killed:
+                continue
             if not self._is_position_eligible(position):
                 continue
             if not self._cooldown_elapsed(position.position_id):
@@ -173,6 +222,77 @@ class RealtimeSLAdjuster:
     def _cooldown_elapsed(self, position_id: str) -> bool:
         last = self._last_adjustment_at.get(position_id, 0.0)
         return (self._now() - last) >= self._throttle_seconds
+
+    # ─────────────────────── kill-switch (W9 T2.3) ────────────────────────
+
+    def _kill_switch_cooldown_elapsed(self, position: PositionContext) -> bool:
+        cooldown = position.kill_switch_cooldown_seconds
+        window = float(cooldown) if cooldown is not None else self._throttle_seconds
+        last = self._last_kill_switch_at.get(position.position_id, 0.0)
+        return (self._now() - last) >= window
+
+    def _atr_current_and_baseline(self, period: int) -> tuple[float | None, float | None]:
+        """Latest ATR and a *pre-spike* baseline = mean of the ATR series EXCLUDING
+        the current (last) bar (review S3 — including it lets a spike inflate its
+        own baseline and dampen detection).
+
+        Fail-safe: too short a buffer, fewer than 2 ATR points, an empty/NaN series,
+        or a non-positive baseline ⇒ ``(None, None)`` so the detector cannot trip on
+        bad data.
+        """
+        series = self._atr_series(period)
+        if series is None or len(series) < 2:
+            return None, None
+        current = float(series.iloc[-1])
+        baseline = float(series.iloc[:-1].mean())
+        if math.isnan(current) or math.isnan(baseline) or baseline <= 0:
+            return None, None
+        return current, baseline
+
+    async def _check_kill_switch(
+        self, bar: dict[str, Any], positions: list[PositionContext]
+    ) -> set[str]:
+        """Detect a volatility spike per kill-switch-armed position and hand the
+        hard close to the injected handler. Returns the ids handed off so the SL
+        loop skips them. No handler wired ⇒ empty set (zero behaviour change)."""
+        if self._kill_switch_handler is None:
+            return set()
+        bar_open = bar["open"]
+        last_bar_move_pct: float | None = None
+        if bar_open > 0:
+            last_bar_move_pct = (bar["close"] - bar_open) / bar_open * 100.0
+
+        killed: set[str] = set()
+        for position in positions:
+            if position.symbol != self.symbol:
+                continue
+            if position.state != PositionState.OPEN:
+                continue
+            if not position.kill_switch_enabled:
+                continue
+            if not self._kill_switch_cooldown_elapsed(position):
+                continue
+
+            current_atr: float | None = None
+            baseline_atr: float | None = None
+            if position.kill_switch_atr_spike_mult is not None:
+                period = int(
+                    position.kill_switch_atr_period or position.volatility_atr_period or 14
+                )
+                current_atr, baseline_atr = self._atr_current_and_baseline(period)
+
+            signal = detect_volatility_spike(
+                current_atr=current_atr,
+                baseline_atr=baseline_atr,
+                spike_mult=position.kill_switch_atr_spike_mult,
+                last_bar_move_pct=last_bar_move_pct,
+                price_move_pct_threshold=position.kill_switch_price_move_pct,
+            )
+            if signal.should_close:
+                await self._kill_switch_handler(position, signal)
+                self._last_kill_switch_at[position.position_id] = self._now()
+                killed.add(position.position_id)
+        return killed
 
     async def _evaluate_pipeline(
         self,
@@ -218,6 +338,11 @@ class RealtimeSLAdjuster:
             return False
 
         queue = await self._queue_resolver(position)
+        closing_side = (
+            OrderSide.BUY
+            if position.side == PositionSide.SHORT
+            else OrderSide.SELL
+        )
         await queue.enqueue(
             OrderTask(
                 priority=OrderPriority.SL_ADJUSTMENT,
@@ -230,9 +355,17 @@ class RealtimeSLAdjuster:
                     "new_trigger_price": float(result.new_sl_price),
                     "trigger_price": float(result.new_sl_price),
                     "new_quantity": float(position.current_quantity),
+                    "full_quantity": float(position.current_quantity),
+                    "side": closing_side,
                     "client_order_id": self._client_order_id_factory(
                         position.position_id, "rt-sl"
                     ),
+                    # Trailing / breakeven / volatility flows operate on an
+                    # OPEN position (no partial-TP fills yet) and target a
+                    # specific sliced quantity — keep the legacy
+                    # ``reduceOnly + new_quantity`` mode rather than the
+                    # multi-TP ``closePosition=true`` mode.
+                    "close_position": False,
                     "reason": f"realtime_pipeline:{result.reason}",
                 },
             )

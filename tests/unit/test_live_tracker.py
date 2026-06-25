@@ -13,9 +13,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import pandas as pd  # noqa: E402
+import pandas_ta as ta  # noqa: E402
+
 from app.services.position.context import PositionContext, PositionSide  # noqa: E402
 from app.services.position.order_queue import OrderPriority, OrderTask  # noqa: E402
 from app.services.position.state_machine import PositionState  # noqa: E402
+from app.services.sl_tp import live_tracker as lt_module  # noqa: E402
 from app.services.sl_tp.live_tracker import RealtimeSLAdjuster  # noqa: E402
 
 SYMBOL = "BTC/USDT:USDT"
@@ -103,6 +107,7 @@ def _build_adjuster(
     time_source: Any = None,
     throttle_seconds: float = 3.0,
     buffer_bars: int = 200,
+    kill_switch_handler: Any = None,
 ) -> tuple[RealtimeSLAdjuster, _RecordingQueue, AsyncMock]:
     queue = queue if queue is not None else _RecordingQueue()
     persist = persist if persist is not None else AsyncMock()
@@ -123,8 +128,19 @@ def _build_adjuster(
         buffer_bars=buffer_bars,
         throttle_seconds=throttle_seconds,
         time_source=now,
+        kill_switch_handler=kill_switch_handler,
     )
     return adjuster, queue, persist
+
+
+class _RecordingKillSwitch:
+    """Async handler stand-in: records (position_id, signal) per kill-switch trip."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    async def __call__(self, position: PositionContext, signal: Any) -> None:
+        self.calls.append((position.position_id, signal))
 
 
 # ────────────────────────── needs_pipeline ────────────────────────────────
@@ -138,6 +154,22 @@ def test_needs_pipeline_true_when_any_dynamic_sl_enabled() -> None:
         position = PositionContext(symbol=SYMBOL)
         setattr(position, flag, True)
         assert RealtimeSLAdjuster.needs_pipeline(position) is True
+
+
+def test_needs_realtime_monitoring_includes_kill_switch() -> None:
+    # T2.3b — the realtime tick must run for a kill-switch-only position too
+    # (no SL pipeline), else on_tick never evaluates the spike detector.
+    base = PositionContext(symbol=SYMBOL)
+    assert RealtimeSLAdjuster.needs_realtime_monitoring(base) is False
+
+    ks_only = PositionContext(symbol=SYMBOL)
+    ks_only.kill_switch_enabled = True
+    assert RealtimeSLAdjuster.needs_pipeline(ks_only) is False
+    assert RealtimeSLAdjuster.needs_realtime_monitoring(ks_only) is True
+
+    sl_only = PositionContext(symbol=SYMBOL)
+    sl_only.trailing_enabled = True
+    assert RealtimeSLAdjuster.needs_realtime_monitoring(sl_only) is True
 
 
 # ────────────────────────── buffer ────────────────────────────────────────
@@ -450,3 +482,140 @@ async def test_on_tick_returns_no_ids_for_zero_or_negative_close() -> None:
 
     assert adjusted == []
     assert queue.tasks == []
+
+
+# ────────────────────────── on_tick: kill-switch (W9 T2.3) ─────────────────
+
+
+def _arm_kill_switch(
+    position: PositionContext,
+    *,
+    spike_mult: float | None = None,
+    price_move_pct: float | None = None,
+    cooldown: int | None = None,
+) -> PositionContext:
+    position.kill_switch_enabled = True
+    position.kill_switch_atr_spike_mult = spike_mult
+    position.kill_switch_price_move_pct = price_move_pct
+    position.kill_switch_cooldown_seconds = cooldown
+    return position
+
+
+async def test_kill_switch_closes_on_price_move_spike() -> None:
+    handler = _RecordingKillSwitch()
+    adjuster, queue, _ = _build_adjuster(kill_switch_handler=handler)
+    # SL pipeline off; only the kill-switch is armed.
+    position = _arm_kill_switch(
+        _build_long_position(trailing=False), price_move_pct=5.0
+    )
+    # Bar with an -8% move (100000 → 92000) ⇒ |8| >= 5 ⇒ trip.
+    await adjuster.on_tick(
+        _kline(open_time=1, open_=100_000, high=100_000, low=92_000, close=92_000),
+        [position],
+    )
+    assert len(handler.calls) == 1
+    pos_id, signal = handler.calls[0]
+    assert pos_id == "p-1"
+    assert signal.reason == "price_move"
+    # The kill-switch did not also enqueue an SL adjustment for this position.
+    assert queue.tasks == []
+
+
+async def test_kill_switch_disabled_does_not_fire() -> None:
+    handler = _RecordingKillSwitch()
+    adjuster, _, _ = _build_adjuster(kill_switch_handler=handler)
+    position = _build_long_position(trailing=False)  # kill_switch_enabled defaults False
+    position.kill_switch_price_move_pct = 5.0  # threshold set but switch OFF
+    await adjuster.on_tick(
+        _kline(open_time=1, open_=100_000, high=100_000, low=92_000, close=92_000),
+        [position],
+    )
+    assert handler.calls == []
+
+
+async def test_kill_switch_no_handler_is_noop() -> None:
+    # No handler wired (the production default) ⇒ never raises; SL path unaffected.
+    adjuster, queue, _ = _build_adjuster()  # kill_switch_handler=None
+    position = _arm_kill_switch(_build_long_position(), price_move_pct=5.0)
+    adjusted = await adjuster.on_tick(
+        _kline(open_time=1, open_=101_000, high=102_000, low=100_500, close=102_000),
+        [position],
+    )
+    # The trailing SL still works exactly as before (handler absent is a pure no-op).
+    assert adjusted == ["p-1"]
+    assert len(queue.tasks) == 1
+
+
+def test_atr_baseline_excludes_current_bar() -> None:
+    # Review S3 — the kill-switch baseline is the mean ATR EXCLUDING the current
+    # (last) bar, so a spike on the latest bar doesn't inflate its own baseline.
+    adjuster, _, _ = _build_adjuster()
+    for index in range(19):
+        adjuster.update_buffer(
+            _kline(open_time=index, open_=100.0, high=101.0, low=99.0, close=100.0)
+        )
+    adjuster.update_buffer(  # final bar: a volatility spike
+        _kline(open_time=19, open_=100.0, high=140.0, low=60.0, close=130.0)
+    )
+    current, baseline = adjuster._atr_current_and_baseline(14)
+    assert current is not None and baseline is not None
+
+    df = pd.DataFrame(adjuster.buffer)
+    series = ta.atr(df["high"], df["low"], df["close"], length=14).dropna()
+    assert current == pytest.approx(float(series.iloc[-1]))
+    assert baseline == pytest.approx(float(series.iloc[:-1].mean()))  # excludes last
+    assert baseline != pytest.approx(float(series.mean()))  # NOT the full-buffer mean (old)
+
+
+async def test_atr_computed_once_per_tick_for_kill_switch_and_sl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review S5 — a position with BOTH volatility-SL and the kill-switch (same ATR
+    # period) computes ta.atr only ONCE per tick (memoized), not twice.
+    real_atr = lt_module.ta.atr
+    calls = {"n": 0}
+
+    def _counting_atr(*args: object, **kwargs: object) -> object:
+        calls["n"] += 1
+        return real_atr(*args, **kwargs)
+
+    monkeypatch.setattr(lt_module.ta, "atr", _counting_atr)
+
+    handler = _RecordingKillSwitch()
+    adjuster, _, _ = _build_adjuster(kill_switch_handler=handler)
+    for index in range(20):  # stable buffer (kill-switch will NOT trip)
+        adjuster.update_buffer(
+            _kline(open_time=index, open_=100_000.0, high=100_500.0, low=99_500.0, close=100_000.0)
+        )
+    position = _build_long_position(trailing=False, volatility=True, current_sl_price=80_000.0)
+    position.kill_switch_enabled = True
+    position.kill_switch_atr_spike_mult = 3.0  # period defaults to volatility's 14
+
+    calls["n"] = 0  # count only the on_tick computation
+    await adjuster.on_tick(
+        _kline(open_time=21, open_=100_000, high=100_500, low=99_500, close=100_000),
+        [position],
+    )
+    assert calls["n"] == 1  # one ta.atr for period 14, shared by kill-switch + SL eval
+    assert handler.calls == []  # stable ⇒ no spike trip
+
+
+async def test_kill_switch_cooldown_fires_once() -> None:
+    state, now = _build_clock()
+    handler = _RecordingKillSwitch()
+    adjuster, _, _ = _build_adjuster(
+        kill_switch_handler=handler, time_source=now, throttle_seconds=3.0
+    )
+    position = _arm_kill_switch(
+        _build_long_position(trailing=False), price_move_pct=5.0, cooldown=10
+    )
+    await adjuster.on_tick(
+        _kline(open_time=1, open_=100_000, high=100_000, low=92_000, close=92_000),
+        [position],
+    )
+    state[0] += 2.0  # within the 10s kill-switch cooldown
+    await adjuster.on_tick(
+        _kline(open_time=2, open_=92_000, high=92_000, low=84_000, close=84_000),
+        [position],
+    )
+    assert len(handler.calls) == 1

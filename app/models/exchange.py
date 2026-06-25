@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -14,6 +14,18 @@ class ExchangeCredential(Base, TimestampMixin):
         UniqueConstraint(
             "user_id", "exchange_name", "account_label", name="uq_exchange_user_name_label"
         ),
+        # W7: prevent two credentials of the same user from pointing at the
+        # physical sub-account (same api_key under two different labels).
+        # Partial so legacy rows that lack a hash do not violate the index;
+        # the credentials service backfills and writes the hash going forward.
+        Index(
+            "uq_exchange_credentials_user_api_key_hash",
+            "user_id",
+            "api_key_hash",
+            unique=True,
+            postgresql_where=text("api_key_hash IS NOT NULL"),
+            sqlite_where=text("api_key_hash IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -24,3 +36,7 @@ class ExchangeCredential(Base, TimestampMixin):
     encrypted_api_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     encrypted_api_secret: Mapped[str] = mapped_column(String(1024), nullable=False)
     encrypted_passphrase: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # W7: sha256(decrypted_api_key) used to detect the same physical
+    # exchange sub-account being registered twice by one user. The partial
+    # unique index in __table_args__ covers all queries that filter by hash.
+    api_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

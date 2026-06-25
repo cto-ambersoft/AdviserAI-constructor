@@ -187,6 +187,175 @@ async def _cleanup_position(adapter: BinanceAdapter) -> None:
     )
 
 
+async def _place_three_tps(
+    adapter: BinanceAdapter,
+    *,
+    position: PositionSnapshot,
+    close_pcts: tuple[float, float, float],
+    tp_offsets: tuple[float, float, float],
+) -> list[ConditionalOrderResult]:
+    """Place three TAKE_PROFIT_MARKET algo orders and return them in level order."""
+    orders: list[ConditionalOrderResult] = []
+    base = position.entry_price or position.mark_price
+    side = _close_side(position)
+    qty_left = Decimal(str(position.size))
+    for level_index, (close_pct, offset_pct) in enumerate(
+        zip(close_pcts, tp_offsets, strict=True)
+    ):
+        if level_index < 2:
+            slice_qty = (
+                Decimal(str(position.size)) * Decimal(str(close_pct)) / Decimal("100")
+            )
+        else:
+            # Final level consumes whatever remains so we never strand dust.
+            slice_qty = qty_left
+        qty_left -= slice_qty
+        trigger = round(base * (1.0 + offset_pct / 100.0), 2)
+        order = await adapter.place_take_profit(
+            symbol=SYMBOL,
+            side=side,
+            quantity=float(slice_qty),
+            trigger_price=trigger,
+            client_order_id=_client_order_id(f"smoke-tp{level_index + 1}"),
+        )
+        orders.append(order)
+    return orders
+
+
+@pytest.mark.asyncio
+async def test_binance_demo_three_tp_lifecycle_no_orphan_sl() -> None:
+    """Manual smoke regression for the multi-TP "TP3 + SL слетели" cluster.
+
+    Drives a full 3-TP lifecycle on Binance Futures testnet and asserts that
+    after the final TP fills:
+    - the position is flat,
+    - no algo order remains on the book (SL must auto-cancel cleanly when the
+      position goes flat in ``closePosition=true`` mode),
+    - the replacement SLs for TP1 and TP2 used ``closePosition=true``
+      semantics (the SL side reports ``quantity == 0`` in that mode).
+
+    Skipped unless ``BINANCE_TESTNET=1`` and the demo API keys are present.
+    The user explicitly asked for a testnet smoke; this test pairs with
+    ``test_three_tp_lifecycle_does_not_emit_zero_qty_replace_sl`` in the
+    unit/integration suite for the in-process equivalent.
+    """
+    if os.getenv("CI"):
+        pytest.skip("Manual-only demo smoke test is skipped in CI.")
+    if os.getenv("BINANCE_TESTNET", "").strip() != "1":
+        pytest.skip("Set BINANCE_TESTNET=1 to enable the 3-TP testnet smoke test.")
+    api_key = os.getenv("BINANCE_DEMO_API_KEY", "").strip()
+    api_secret = os.getenv("BINANCE_DEMO_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        pytest.skip("BINANCE_DEMO_API_KEY and BINANCE_DEMO_API_SECRET are required.")
+
+    exchange = ccxt.binance(
+        {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"},
+        }
+    )
+    exchange.enable_demo_trading(True)
+    adapter = BinanceAdapter(
+        ccxt_exchange=exchange,
+        api_key=api_key,
+        api_secret=api_secret,
+        rate_limiter=AdaptiveRateLimiter("binance"),
+        mode="demo",
+    )
+
+    try:
+        await exchange.load_markets()
+        await _normalize_symbol_state(adapter)
+        entry_quantity = await _entry_quantity(exchange)
+
+        # Open a small LONG position.
+        await adapter.place_entry_order(
+            symbol=SYMBOL,
+            side=OrderSide.BUY,
+            quantity=entry_quantity,
+            client_order_id=_client_order_id("smoke-3tp-entry"),
+        )
+        position = await _wait_for_position(adapter)
+        assert position.side == PositionSide.LONG and position.size > 0
+
+        # Place an initial position-attached SL (closePosition=true).
+        initial_sl = await adapter.place_stop_loss(
+            symbol=SYMBOL,
+            side=OrderSide.SELL,
+            quantity=position.size,
+            trigger_price=_sl_price(position, 0.95),
+            client_order_id=_client_order_id("smoke-3tp-sl"),
+            close_position=True,
+        )
+        await _wait_for_stop_order(adapter, expected_order_id=initial_sl.exchange_order_id)
+
+        # Three TPs at +0.2% / +0.4% / +0.6% with 33/33/34 split.
+        tps = await _place_three_tps(
+            adapter,
+            position=position,
+            close_pcts=(33.0, 33.0, 34.0),
+            tp_offsets=(0.2, 0.4, 0.6),
+        )
+
+        # Move the SL forward as TP1, TP2 fire by issuing replace_sl with
+        # ``close_position=True`` (matches the multi-TP path in production).
+        # In production these moves fire only AFTER TP1/TP2 fill — i.e. once
+        # price has risen above entry — so a "forward" SL still sits below the
+        # mark. The smoke cannot wait for a real price move, so we place valid
+        # SELL stops strictly below the live mark (ratcheting the trigger
+        # upward) while still exercising the closePosition cancel-and-replace
+        # path twice. This is the exact path that previously failed with
+        # Binance -4130 ("two GTE_GTC closePosition stops per direction").
+        basis = position.entry_price or position.mark_price
+        new_sl_after_tp1 = await adapter.cancel_and_replace_sl(
+            symbol=SYMBOL,
+            existing_order_id=initial_sl.exchange_order_id,
+            new_trigger_price=round(basis * 0.996, 2),
+            new_quantity=0.0,
+            client_order_id=_client_order_id("smoke-3tp-sl1"),
+            close_position=True,
+        )
+        new_sl_after_tp2 = await adapter.cancel_and_replace_sl(
+            symbol=SYMBOL,
+            existing_order_id=new_sl_after_tp1.exchange_order_id,
+            new_trigger_price=round(basis * 0.998, 2),
+            new_quantity=0.0,
+            client_order_id=_client_order_id("smoke-3tp-sl2"),
+            close_position=True,
+        )
+
+        # The final SL must have ``quantity == 0`` (closePosition mode).
+        assert new_sl_after_tp2.quantity == 0.0
+
+        # Force-close the position (the production flow waits for the actual
+        # market move to hit TP3; a smoke test must not). After flatten,
+        # Binance auto-cancels remaining algo orders. Verify the order book
+        # is empty and we never had to place an SL with explicit qty=0.
+        await adapter.partial_close(
+            symbol=SYMBOL,
+            side=OrderSide.SELL,
+            quantity=position.size,
+            client_order_id=_client_order_id("smoke-3tp-flatten"),
+        )
+        await _wait_for_position_closed(adapter)
+
+        # Allow Binance a moment to garbage-collect orphan reduceOnly orders.
+        await asyncio.sleep(2.0)
+        remaining = await adapter.get_open_conditional_orders(SYMBOL)
+        assert not remaining, (
+            f"orphan algo orders remain after position close: "
+            f"{[o.exchange_order_id for o in remaining]!r}"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await _cleanup_position(adapter)
+        with contextlib.suppress(Exception):
+            await _cancel_all_conditional_orders(adapter)
+        await exchange.close()
+
+
 @pytest.mark.asyncio
 async def test_binance_demo_smoke() -> None:
     if os.getenv("CI"):

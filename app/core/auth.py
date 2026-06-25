@@ -15,6 +15,8 @@ pwd_hasher = PasswordHash.recommended()
 bearer_scheme = HTTPBearer(auto_error=False)
 ACCESS_TOKEN_TYPE = "access"
 REFRESH_TOKEN_TYPE = "refresh"
+STEP_UP_TOKEN_TYPE = "step_up"
+LOGIN_2FA_TOKEN_TYPE = "login_2fa"
 
 
 def hash_password(password: str) -> str:
@@ -69,6 +71,98 @@ def decode_access_token(token: str) -> str:
         ) from exc
     except JWTError as exc:
         raise credentials_exception from exc
+    return subject
+
+
+def create_step_up_token(subject: str, expires_delta: timedelta | None = None) -> tuple[str, int]:
+    """Mint a short-lived step-up token (minted only after a fresh 2FA code).
+
+    Distinct ``type`` so it can never be used as an access token and vice versa, and
+    a unique ``jti`` so it can be enforced single-use (one re-auth → one action).
+    """
+    settings = get_settings()
+    now = datetime.now(UTC)
+    expires_at = now + (
+        expires_delta
+        if expires_delta is not None
+        else timedelta(minutes=settings.jwt_step_up_token_expire_minutes)
+    )
+    token = jwt.encode(
+        {"sub": subject, "exp": expires_at, "type": STEP_UP_TOKEN_TYPE, "jti": token_urlsafe(16)},
+        settings.jwt_secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+    return token, int((expires_at - now).total_seconds())
+
+
+def decode_step_up_token(token: str) -> tuple[str, str]:
+    """Validate a step-up token (correct type, signature, not expired).
+
+    Returns ``(subject, jti)``. Raises 403 (not 401) — the user IS authenticated;
+    they just lack a current step-up authorization for this critical action.
+    """
+    settings = get_settings()
+    forbidden = HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="A valid step-up (2FA) authorization is required for this action.",
+    )
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+        if payload.get("type") != STEP_UP_TOKEN_TYPE:
+            raise forbidden
+        subject = payload.get("sub")
+        jti = payload.get("jti")
+        if not isinstance(subject, str) or not subject or not isinstance(jti, str) or not jti:
+            raise forbidden
+    except ExpiredSignatureError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Step-up authorization has expired — re-enter your 2FA code.",
+        ) from exc
+    except JWTError as exc:
+        raise forbidden from exc
+    return subject, jti
+
+
+def create_login_challenge_token(subject: str) -> tuple[str, int]:
+    """Mint a short-lived login-2FA challenge token (password verified, code pending).
+
+    Distinct ``type`` so it can only be redeemed at ``/2fa/login`` — never used as an
+    access/step-up token, nor vice versa.
+    """
+    settings = get_settings()
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(minutes=settings.login_2fa_challenge_minutes)
+    token = jwt.encode(
+        {"sub": subject, "exp": expires_at, "type": LOGIN_2FA_TOKEN_TYPE},
+        settings.jwt_secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+    return token, int((expires_at - now).total_seconds())
+
+
+def decode_login_challenge_token(token: str) -> str:
+    """Validate a login-2FA challenge (correct type, signature, not expired) → subject.
+
+    Raises 401 — an invalid/expired challenge means the login attempt must restart.
+    """
+    settings = get_settings()
+    unauthorized = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired 2FA challenge — please sign in again.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+        if payload.get("type") != LOGIN_2FA_TOKEN_TYPE:
+            raise unauthorized
+        subject = payload.get("sub")
+        if not isinstance(subject, str) or not subject:
+            raise unauthorized
+    except ExpiredSignatureError as exc:
+        raise unauthorized from exc
+    except JWTError as exc:
+        raise unauthorized from exc
     return subject
 
 

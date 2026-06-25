@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from app.services import audit as auto_trade_audit
 from app.services.exchange.adapter import ConditionalOrderResult, ExchangeAdapter, OrderSide
 from app.services.position.context import PositionContext, PositionSide, SLHistoryEntry
 from app.services.position.order_queue import OrderPriority, OrderTask
@@ -18,7 +19,7 @@ from app.services.position.state_machine import (
     PositionState,
     TransitionTrigger,
 )
-from app.services.sl_tp.live_tracker import RealtimeSLAdjuster
+from app.services.sl_tp.live_tracker import KillSwitchHandler, RealtimeSLAdjuster
 from app.services.sl_tp.multi_tp import MultiTPEngine
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,22 @@ class WebSocketManager:
     JITTER_UNHEALTHY_MS = 5000
     PROACTIVE_RECONNECT_COOLDOWN = 30
     SL_PIPELINE_KLINE_INTERVAL = "1m"
+    # Tolerance used by _match_tp_level when matching a TP fill price to a
+    # configured TP level price. Sub-tick precision is brittle: real fills
+    # arrive with rounding/slippage in the tens of ticks. 0.5% accommodates
+    # that without producing false matches between adjacent levels (which are
+    # typically configured >= 1% apart). Override via env if needed.
+    MULTI_TP_MATCH_TOLERANCE_PCT = 0.005
+    MULTI_TP_MIN_DELTA = 1e-4
+    # When a position-update event reports a partial close but no matching
+    # order/execution event has arrived, wait this many seconds before
+    # attempting to infer the TP fill ourselves. Set high enough that the WS
+    # order topic has a chance to deliver the event first.
+    PARTIAL_CLOSE_RECONCILE_DELAY_SECONDS = 5.0
+    # Maximum relative discrepancy between the observed quantity delta and a
+    # configured TP level's expected close-fraction for the reconciler to
+    # consider it a match.
+    PARTIAL_CLOSE_QTY_TOLERANCE_PCT = 0.005
 
     def __init__(
         self,
@@ -51,11 +68,15 @@ class WebSocketManager:
         *,
         persist_position: PositionPersister | None = None,
         order_queue_resolver: OrderQueueResolver | None = None,
+        kill_switch_handler: KillSwitchHandler | None = None,
     ) -> None:
         self.adapter = adapter
         self.account_id = str(account_id)
         self._persist_position_handler = persist_position
         self._order_queue_resolver = order_queue_resolver
+        # W9 T2.3b — forwarded to each per-symbol RealtimeSLAdjuster so a confirmed
+        # volatility spike is handed to a session-backed close. None ⇒ kill-switch off.
+        self._kill_switch_handler = kill_switch_handler
 
         self._connected = False
         self._positions: dict[str, PositionContext] = {}
@@ -77,10 +98,109 @@ class WebSocketManager:
         # Realtime SL pipeline (trailing/breakeven/volatility) — one tracker per symbol.
         self._sl_adjusters: dict[str, RealtimeSLAdjuster] = {}
 
-    def track_position(self, position: PositionContext) -> None:
-        """Register a live position for routing and reconciliation."""
-        for alias in self._symbol_aliases(position.symbol):
-            self._positions[alias] = position
+        # Per-position locks ensure that two near-simultaneous lifecycle events
+        # (e.g. TP1 + TP2 in the same kline) do not interleave their mutations
+        # of position.current_quantity / tp_levels[i].status.
+        self._position_locks: dict[str, asyncio.Lock] = {}
+
+        # Pending partial-close reconcilers keyed by position_id. We keep a
+        # reference so that a later TP fill event can cancel the deferred task
+        # and so that we can surface diagnostics if multiple events land
+        # before the reconciliation deadline.
+        self._partial_close_reconcilers: dict[str, asyncio.Task[None]] = {}
+
+    def is_connected(self) -> bool:
+        """True while the user-data stream is believed connected."""
+        return self._connected
+
+    def is_reconnecting(self) -> bool:
+        """True while a reconnect cycle is already in progress."""
+        return self._reconnecting
+
+    def is_tracked(self, position_id: str) -> bool:
+        """Return True if any alias resolves to a position with this id."""
+        target = str(position_id or "")
+        if not target:
+            return False
+        for live in self._positions.values():
+            if str(live.position_id) == target:
+                return True
+        return False
+
+    def track_position(
+        self,
+        position: PositionContext,
+        *,
+        replace_in_place: bool = False,
+    ) -> None:
+        """Register a live position for routing and reconciliation.
+
+        When ``replace_in_place=False`` (default) and a position with the
+        same ``position_id`` is already tracked, the in-memory live context
+        wins. DB-shaped fields from ``position`` are merged onto the live
+        context so updates to ``entry_price`` / ``tp_levels[*].trigger_price``
+        / ``sl_lock_pct`` etc. picked up by hydration still flow through,
+        but in-flight state (``current_quantity``, ``state_machine.state``,
+        ``tp_levels[*].status``, ``dispatched_sl_levels``,
+        ``sl_exchange_order_id``, histories) is preserved. Without this the
+        60-second hydration loop silently rewinds engine mutations
+        whenever DB persist had not caught up.
+
+        Pass ``replace_in_place=True`` to force the new context to replace
+        the live one — used by tests and any caller that knows the new
+        snapshot is authoritative.
+        """
+        live = self._find_position_by_id(str(position.position_id))
+        if live is None or replace_in_place or live is position:
+            for alias in self._symbol_aliases(position.symbol):
+                self._positions[alias] = position
+            return
+
+        self._merge_persisted_fields_into_live(live=live, snapshot=position)
+        # Re-register aliases (symbol could have been renamed, though rare)
+        # while keeping the live object identity intact.
+        for alias in self._symbol_aliases(live.symbol):
+            self._positions[alias] = live
+
+    def _find_position_by_id(self, position_id: str) -> PositionContext | None:
+        if not position_id:
+            return None
+        for live in self._positions.values():
+            if str(live.position_id) == position_id:
+                return live
+        return None
+
+    @staticmethod
+    def _merge_persisted_fields_into_live(
+        *,
+        live: PositionContext,
+        snapshot: PositionContext,
+    ) -> None:
+        """Copy DB-shaped (configuration) fields from ``snapshot`` onto ``live``.
+
+        Leaves in-memory invariants (status flags, dispatched-set, current
+        size, state machine, histories, exchange order ids) on ``live``.
+        """
+        # Static configuration: safe to refresh from DB
+        live.entry_price = snapshot.entry_price
+        live.original_quantity = snapshot.original_quantity
+        live.leverage = snapshot.leverage
+        live.current_sl_price = snapshot.current_sl_price
+        live.current_tp_price = snapshot.current_tp_price
+        live.tp_mode = snapshot.tp_mode
+
+        # Per-level configuration: refresh trigger/lock parameters but not
+        # ``status``, ``exchange_order_id``, or any other in-flight bookkeeping.
+        snapshot_by_index = {idx: lvl for idx, lvl in enumerate(snapshot.tp_levels)}
+        for idx, live_level in enumerate(live.tp_levels):
+            snap_level = snapshot_by_index.get(idx)
+            if snap_level is None:
+                continue
+            live_level.trigger_price = snap_level.trigger_price
+            live_level.close_pct = snap_level.close_pct
+            live_level.sl_lock_pct = snap_level.sl_lock_pct
+            live_level.move_sl_to = snap_level.move_sl_to
+            live_level.price_offset_pct = snap_level.price_offset_pct
 
     def untrack_position(self, symbol: str) -> None:
         """Remove a position from live routing."""
@@ -212,13 +332,28 @@ class WebSocketManager:
         await self._handle_disconnect()
 
     async def _handle_order_update(self, event: dict[str, Any]) -> None:
-        """Apply guard pipeline and forward safe order events to the position handler."""
+        """Apply guard pipeline and forward safe order events to the position handler.
+
+        The stale-tick guard is meant for raw price/ticker updates. Order
+        lifecycle events (fills, conditional triggers) carry an event price
+        that is the actual fill or trigger price and may legitimately sit far
+        from the last seen mark/trade tick — particularly on cold start when
+        ``_last_good_prices`` was not yet seeded. Apply the guard ONLY to
+        non-fill, non-conditional updates.
+        """
         symbol = str(event.get("symbol", "") or "")
         price = self._extract_event_price(event)
-        tick_valid = True
+
+        is_fill = self._is_fill_event(event)
+        is_conditional = self._is_conditional_order_event(event)
 
         if symbol and price > 0:
+            # Always refresh the cache so subsequent stale-tick checks have a
+            # current reference, but ignore the verdict for fill/conditional
+            # events to avoid silently dropping them on cold start.
             tick_valid = self._check_stale_tick(symbol, price)
+            if not tick_valid and not (is_fill or is_conditional):
+                return
 
         if not self._check_warmup():
             logger.debug(
@@ -228,9 +363,6 @@ class WebSocketManager:
             )
             return
 
-        if not tick_valid:
-            return
-
         position = self._find_position(symbol)
         if position is None:
             return
@@ -238,29 +370,168 @@ class WebSocketManager:
         await self._route_to_position(position, event)
 
     async def _handle_position_update(self, event: dict[str, Any]) -> None:
-        """Always process confirmed position-state updates from the exchange."""
+        """Always process confirmed position-state updates from the exchange.
+
+        All mutations of ``position.current_quantity`` / state-machine state
+        run under the per-position lock so concurrent ``_route_to_position``
+        events (which hold the same lock) cannot interleave their writes
+        with this handler. Without the lock the engine and this handler
+        race for ``current_quantity`` — observable in production as four
+        ``sl_adjustment_decided`` audit pairs in the same millisecond for
+        a single TP1 fill.
+        """
         symbol = str(event.get("symbol", "") or "")
         position = self._find_position(symbol)
         if position is None:
             return
 
-        new_size = abs(self._coerce_float(event.get("size", event.get("qty")), default=0.0))
-        if new_size <= 0:
-            if position.state != PositionState.CLOSED or position.current_quantity > 0:
-                position.current_quantity = 0.0
-                await self._close_position(
-                    position,
-                    initial_trigger=TransitionTrigger.MANUAL_CLOSE,
-                    reason=f"Position closed: {event.get('reason', 'unknown')}",
-                    metadata=self._transition_metadata_from_event(event),
-                )
-                await self._cancel_remaining_orders(position)
-                await self._persist_position(position)
-            return
+        async with self._get_position_lock(position):
+            new_size = abs(self._coerce_float(event.get("size", event.get("qty")), default=0.0))
+            if new_size <= 0:
+                if position.state != PositionState.CLOSED or position.current_quantity > 0:
+                    position.current_quantity = 0.0
+                    await self._close_position(
+                        position,
+                        initial_trigger=TransitionTrigger.MANUAL_CLOSE,
+                        reason=f"Position closed: {event.get('reason', 'unknown')}",
+                        metadata=self._transition_metadata_from_event(event),
+                    )
+                    await self._cancel_remaining_orders(position)
+                    await self._persist_position(position)
+                return
 
-        if new_size != float(position.current_quantity):
+            old_size = float(position.current_quantity)
+            if new_size == old_size:
+                return
+
+            # If the position shrank without us seeing a TP fill via the order
+            # topic, schedule a deferred reconciler. The order topic has up to
+            # PARTIAL_CLOSE_RECONCILE_DELAY_SECONDS to deliver the fill; when
+            # it does, _handle_tp_triggered_event clears the pending
+            # reconciler.
+            if (
+                new_size < old_size
+                and position.tp_mode == "multi"
+                and position.tp_levels
+                and position.state in {PositionState.OPEN, PositionState.ADJUSTING}
+            ):
+                delta_qty = old_size - new_size
+                self._schedule_partial_close_reconciler(position, delta_qty)
+
             position.current_quantity = new_size
             await self._persist_position(position)
+
+    def _schedule_partial_close_reconciler(
+        self,
+        position: PositionContext,
+        delta_qty: float,
+    ) -> None:
+        """Defer multi-TP advancement until the order topic has had its chance."""
+        existing = self._partial_close_reconcilers.get(position.position_id)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        task = asyncio.create_task(self._reconcile_partial_close(position, delta_qty))
+        self._partial_close_reconcilers[position.position_id] = task
+
+    async def _reconcile_partial_close(
+        self,
+        position: PositionContext,
+        delta_qty: float,
+    ) -> None:
+        try:
+            await asyncio.sleep(self.PARTIAL_CLOSE_RECONCILE_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+        # If a TP fill was processed in the interim, the pending tp_levels
+        # status will have advanced — the order topic won.
+        async with self._get_position_lock(position):
+            self._partial_close_reconcilers.pop(position.position_id, None)
+
+            if position.state not in {PositionState.OPEN, PositionState.ADJUSTING}:
+                return
+
+            matched_index = self._closest_open_tp_level_by_qty(position, delta_qty)
+            if matched_index is None:
+                logger.info(
+                    "[%s] Partial-close reconciler could not match delta %.10g "
+                    "to any open TP level for position=%s; leaving alone.",
+                    self.account_id,
+                    delta_qty,
+                    position.position_id,
+                )
+                return
+
+            level = position.tp_levels[matched_index]
+            logger.warning(
+                "[%s] Inferring TP%d fill from position-update for position=%s "
+                "(no order event received within %.1fs)",
+                self.account_id,
+                matched_index + 1,
+                position.position_id,
+                self.PARTIAL_CLOSE_RECONCILE_DELAY_SECONDS,
+            )
+            await auto_trade_audit.emit(
+                "multi_tp_inferred_from_position_update",
+                {
+                    "account_id": self.account_id,
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "matched_level": matched_index,
+                    "delta_qty": delta_qty,
+                    "level_close_pct": level.close_pct,
+                    "level_trigger_price": level.trigger_price,
+                },
+            )
+
+            queue = await self._get_order_queue(position)
+            engine = MultiTPEngine(
+                position=position,
+                adapter=self.adapter,
+                order_queue=queue,
+                sl_adjustment_callback_factory=lambda triggered_level: self._build_sl_adjustment_callback(
+                    position=position,
+                    reason=self._tp_level_sl_adjustment_reason(position, triggered_level),
+                    trigger_source="position_update_inferred",
+                ),
+            )
+            # ``handle_tp_triggered`` subtracts the level's close-qty from
+            # ``current_quantity``; the position-update handler already
+            # decremented it by the same delta when the partial close was
+            # observed. Without this restore the engine would double-count
+            # and immediately mark the position as ``position_closing`` —
+            # skipping the SL move that the reconciler exists to perform.
+            position.current_quantity = float(position.current_quantity) + float(delta_qty)
+            await engine.handle_tp_triggered(triggered_level=matched_index)
+            await self._persist_position(position)
+
+    def _cancel_partial_close_reconciler(self, position: PositionContext) -> None:
+        existing = self._partial_close_reconcilers.pop(position.position_id, None)
+        if existing is not None and not existing.done():
+            existing.cancel()
+
+    def _closest_open_tp_level_by_qty(
+        self,
+        position: PositionContext,
+        delta_qty: float,
+    ) -> int | None:
+        if delta_qty <= 0 or position.original_quantity <= 0:
+            return None
+        best_index: int | None = None
+        best_diff: float | None = None
+        for index, level in enumerate(position.tp_levels):
+            if level.status == "triggered":
+                continue
+            expected = position.original_quantity * (float(level.close_pct) / 100.0)
+            if expected <= 0:
+                continue
+            diff_pct = abs(delta_qty - expected) / expected
+            if diff_pct > self.PARTIAL_CLOSE_QTY_TOLERANCE_PCT:
+                continue
+            if best_diff is None or diff_pct < best_diff:
+                best_index = index
+                best_diff = diff_pct
+        return best_index
 
     async def _handle_disconnect(self) -> None:
         """Reconnect with exponential backoff and restore local state via REST sync."""
@@ -338,21 +609,38 @@ class WebSocketManager:
             await self._ensure_realtime_sl_pipeline(position)
 
     async def _route_to_position(self, position: PositionContext, event: dict[str, Any]) -> None:
-        """Route lifecycle events first, then fall back to optional position handlers."""
-        if await self._route_lifecycle_event(position, event):
-            return
+        """Route lifecycle events first, then fall back to optional position handlers.
 
-        for handler_name in ("handle_order_update", "on_order_update", "ws_order_handler"):
-            handler = getattr(position, handler_name, None)
-            if callable(handler):
-                await _maybe_await(handler(event))
+        All mutating routing is serialised per-position so that concurrent TP
+        fills cannot interleave their state updates.
+        """
+        async with self._get_position_lock(position):
+            if await self._route_lifecycle_event(position, event):
                 return
 
-        logger.debug(
-            "[%s] No order-update handler is attached to position %s.",
-            self.account_id,
-            position.position_id,
-        )
+            for handler_name in (
+                "handle_order_update",
+                "on_order_update",
+                "ws_order_handler",
+            ):
+                handler = getattr(position, handler_name, None)
+                if callable(handler):
+                    await _maybe_await(handler(event))
+                    return
+
+            logger.debug(
+                "[%s] No order-update handler is attached to position %s.",
+                self.account_id,
+                position.position_id,
+            )
+
+    def _get_position_lock(self, position: PositionContext) -> asyncio.Lock:
+        key = position.position_id or f"obj:{id(position)}"
+        lock = self._position_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._position_locks[key] = lock
+        return lock
 
     async def _persist_position(self, position: PositionContext) -> None:
         """Persist the latest position state when an integration hook is configured."""
@@ -453,9 +741,85 @@ class WebSocketManager:
             return False
 
         if position.tp_mode == "multi" and position.tp_levels:
+            # Hard dedup — INDEPENDENT of ``_match_tp_level``. Binance emits
+            # multiple WS events for one TP fill:
+            #   1. ALGO_UPDATE with status=TRIGGERED (algo condition met)
+            #   2. ALGO_UPDATE with status=FINISHED (underlying market
+            #      order completed)
+            #   3. ORDER_TRADE_UPDATE for the underlying market order's fill
+            # All three look like fills to ``_is_fill_event``. If any path
+            # ever lets a duplicate through ``_match_tp_level`` (e.g. an
+            # older code variant with a price-fallback, a future refactor,
+            # or a brand-new event shape from Binance), we still want to
+            # short-circuit at the top of the TP-trigger handler. Match
+            # the event's ``order_id`` / ``client_order_id`` against ANY
+            # level — open OR triggered. If it matches a triggered level,
+            # treat as duplicate.
+            if self._event_matches_triggered_level(position, event):
+                logger.debug(
+                    "[%s] Skipping duplicate TP-trigger event for already-"
+                    "triggered level on position=%s order_id=%s",
+                    self.account_id,
+                    position.position_id,
+                    self._event_order_identifier(event),
+                )
+                self._cancel_partial_close_reconciler(position)
+                return True
+
             matched_level = self._match_tp_level(position, event)
             if matched_level is None:
-                return self._is_duplicate_tp_trigger(position, event)
+                if self._is_duplicate_tp_trigger(position, event):
+                    return True
+                # Real fill arrived but we cannot map it to a configured level.
+                # Surface this loudly: the SL move logic depends on knowing
+                # which level fired. Silent return would reproduce the user-
+                # observed bug ("TP filled but SL didn't move").
+                logger.warning(
+                    "[%s] Multi-TP fill could not be matched to any level for "
+                    "position=%s symbol=%s event_order_id=%s event_price=%s",
+                    self.account_id,
+                    position.position_id,
+                    position.symbol,
+                    self._event_order_identifier(event),
+                    self._extract_event_price(event),
+                )
+                await auto_trade_audit.emit(
+                    "tp_fill_unmatched",
+                    {
+                        "account_id": self.account_id,
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "event_order_id": self._event_order_identifier(event),
+                        "event_price": self._extract_event_price(event),
+                        "event_trigger_price": self._coerce_float(
+                            event.get("trigger_price"), default=0.0
+                        ),
+                        "tp_levels": [
+                            {
+                                "level": level.level,
+                                "trigger_price": level.trigger_price,
+                                "status": level.status,
+                                "exchange_order_id": level.exchange_order_id,
+                            }
+                            for level in position.tp_levels
+                        ],
+                    },
+                )
+                # Returning True so the caller does NOT fall through to a
+                # generic "no handler" debug log — we have handled the event
+                # by acknowledging the unmatched state.
+                return True
+
+            logger.info(
+                "[%s] Multi-TP fill matched: position=%s level=%s tp_price=%.10g "
+                "event_price=%.10g event_order_id=%s",
+                self.account_id,
+                position.position_id,
+                matched_level,
+                position.tp_levels[matched_level].trigger_price,
+                self._extract_event_price(event),
+                self._event_order_identifier(event),
+            )
 
             queue = await self._get_order_queue(position)
             engine = MultiTPEngine(
@@ -469,6 +833,9 @@ class WebSocketManager:
                 ),
             )
             await engine.handle_tp_triggered(triggered_level=matched_level)
+            # The order topic delivered before the deferred reconciler fired;
+            # cancel it to prevent a duplicate inferred advancement.
+            self._cancel_partial_close_reconciler(position)
             if position.state == PositionState.CLOSED or position.current_quantity <= 0:
                 await self._cancel_remaining_orders(position)
             await self._persist_position(position)
@@ -526,6 +893,10 @@ class WebSocketManager:
                     "trigger_price": float(position.current_sl_price),
                     "client_order_id": self._build_client_order_id(position.position_id, "emergency-sl"),
                     "reduce_only": True,
+                    # Emergency SL also covers the whole live position — we
+                    # don't know the exact remaining quantity post-disconnect
+                    # without an extra REST round-trip.
+                    "close_position": True,
                     "reason": "ws_full_state_sync_missing_sl",
                 },
             )
@@ -552,6 +923,11 @@ class WebSocketManager:
                             "sl",
                         ),
                         "reduce_only": True,
+                        # Initial SL closes the whole live position; the
+                        # quantity tracks partial TP fills automatically and
+                        # only ``replace_sl`` (issued when sl_lock_pct moves
+                        # the trigger price) needs to mutate the SL.
+                        "close_position": True,
                     },
                     on_success=self._build_conditional_order_callback(
                         position=position,
@@ -616,8 +992,9 @@ class WebSocketManager:
         )
 
     async def _ensure_realtime_sl_pipeline(self, position: PositionContext) -> None:
-        """Subscribe a kline stream and create a tracker when the pipeline is enabled."""
-        if not RealtimeSLAdjuster.needs_pipeline(position):
+        """Subscribe a kline stream and create a tracker when realtime monitoring
+        (SL pipeline or the Volatility Kill-Switch) is enabled."""
+        if not RealtimeSLAdjuster.needs_realtime_monitoring(position):
             return
         if position.symbol in self._sl_adjusters:
             return
@@ -627,6 +1004,7 @@ class WebSocketManager:
             queue_resolver=self._get_order_queue,
             client_order_id_factory=self._build_client_order_id,
             persist_handler=self._persist_position,
+            kill_switch_handler=self._kill_switch_handler,
         )
         self._sl_adjusters[position.symbol] = adjuster
 
@@ -662,7 +1040,8 @@ class WebSocketManager:
         positions = [
             position
             for position in self._tracked_positions()
-            if position.symbol == symbol and RealtimeSLAdjuster.needs_pipeline(position)
+            if position.symbol == symbol
+            and RealtimeSLAdjuster.needs_realtime_monitoring(position)
         ]
         if not positions:
             return
@@ -695,7 +1074,7 @@ class WebSocketManager:
                 PositionState.FAILED,
             }:
                 continue
-            if RealtimeSLAdjuster.needs_pipeline(active):
+            if RealtimeSLAdjuster.needs_realtime_monitoring(active):
                 return
 
         # No other tracked position needs this adjuster; drop the local reference.
@@ -896,6 +1275,61 @@ class WebSocketManager:
         return next_state
 
     async def _cancel_remaining_orders(self, position: PositionContext) -> None:
+        # Drop any in-flight protective-order tasks for this position before
+        # we cancel on the exchange. Otherwise a queued ``replace_sl`` from
+        # the same TP fill would race the cancel here — placing a new SL on
+        # a now-flat position (which Binance auto-cancels under
+        # ``reduceOnly=true``) and then trying to ``DELETE`` the algoId we
+        # just removed below.
+        try:
+            queue = await self._get_order_queue(position)
+        except Exception:
+            queue = None
+        if queue is not None:
+            purge = getattr(queue, "purge_pending", None)
+            if callable(purge):
+                try:
+                    await purge(
+                        position.position_id,
+                        {"place_sl", "replace_sl", "place_tp", "replace_tp"},
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] purge_pending failed during cleanup for position %s.",
+                        self.account_id,
+                        position.position_id,
+                    )
+
+            # Drain any currently-executing protective task before we DELETE
+            # algoOrders on the exchange. ``cancel_and_replace_sl`` is
+            # place-first / cancel-last on Binance; without this wait the
+            # exchange DELETE below would target the freshly-placed new SL
+            # the queue task just minted (its on_success callback hadn't
+            # written ``position.sl_exchange_order_id`` yet).
+            quiesce = getattr(queue, "await_quiescent", None)
+            if callable(quiesce):
+                try:
+                    quiesced = await quiesce(
+                        position.position_id,
+                        {"replace_sl", "place_sl"},
+                        2.0,
+                    )
+                    if not quiesced:
+                        await auto_trade_audit.emit(
+                            "cancel_remaining_orders_quiesce_timeout",
+                            {
+                                "account_id": self.account_id,
+                                "position_id": position.position_id,
+                                "symbol": position.symbol,
+                            },
+                        )
+                except Exception:
+                    logger.exception(
+                        "[%s] await_quiescent failed during cleanup for position %s.",
+                        self.account_id,
+                        position.position_id,
+                    )
+
         order_ids = {
             order_id
             for order_id in (
@@ -1109,46 +1543,166 @@ class WebSocketManager:
         if self._order_type(event) == "take_profit":
             return True
 
-        event_order_id = self._event_order_identifier(event)
-        if not event_order_id:
+        event_ids = {
+            value
+            for value in (
+                str(event.get("order_id", "")).strip(),
+                str(event.get("client_order_id", "")).strip(),
+            )
+            if value
+        }
+        if not event_ids:
             return False
 
         return any(
-            level.exchange_order_id and str(level.exchange_order_id) == event_order_id
+            level.exchange_order_id and str(level.exchange_order_id) in event_ids
             for level in position.tp_levels
         )
 
     def _match_tp_level(self, position: PositionContext, event: dict[str, Any]) -> int | None:
-        event_order_id = self._event_order_identifier(event)
-        if event_order_id:
+        """Resolve which TP level a WS fill event corresponds to.
+
+        Order of preference:
+          1. exact match on exchange_order_id against either the event's
+             ``order_id`` (real exchange id) or ``client_order_id``
+             (Bybit's ``orderLinkId``); the latter handles the case where we
+             stored the client id locally because the venue did not return a
+             usable exchange id at placement time;
+          2. only when the event carries NO order ids (rare path, e.g.
+             ALGO_UPDATE missing the ``aid`` field) we fall back to a
+             price-based match against ``event.trigger_price`` then the
+             fill price, picking the closest non-triggered level within
+             ``MULTI_TP_MATCH_TOLERANCE_PCT``.
+
+        Returns the level index of the closest non-triggered level, or None.
+
+        Critical: when the event has order ids but none matches an open
+        level, this is almost always a duplicate event for a level we
+        already triggered (Binance occasionally re-emits ORDER_TRADE_UPDATE
+        / ALGO_UPDATE around reconnect, and our partial-close reconciler
+        can race the order topic). The previous implementation fell
+        through to price matching here and cheerfully matched the next
+        open level by price proximity, cascading the position into a
+        chain of false TP advancements — TP1 fills, duplicate event
+        arrives, the matcher returns TP2 by price, then TP3, the engine
+        zeroes ``current_quantity``, and ``_cancel_remaining_orders`` rips
+        the live SL off a position that is still open on the exchange.
+        The caller's ``_is_duplicate_tp_trigger`` only runs when this
+        method returns None, so we must return None here when an event
+        is "addressed" (has ids) but the addressee is already done.
+        """
+        event_ids = {
+            value
+            for value in (
+                str(event.get("order_id", "")).strip(),
+                str(event.get("client_order_id", "")).strip(),
+            )
+            if value
+        }
+        if event_ids:
             for index, level in enumerate(position.tp_levels):
                 if level.status == "triggered":
                     continue
-                if level.exchange_order_id and str(level.exchange_order_id) == event_order_id:
+                if level.exchange_order_id and str(level.exchange_order_id) in event_ids:
                     return index
+            # Event carries ids but none of them point at an open level.
+            # Either a duplicate of an already-triggered level (caller
+            # will detect via ``_is_duplicate_tp_trigger``) or a stale
+            # event for an order we no longer track. Do NOT fall back to
+            # price matching — that's exactly the path that produced the
+            # observed cascade.
+            return None
+
+        # No event ids — rare path. Fall back to price matching.
+        event_trigger = self._coerce_float(event.get("trigger_price"), default=0.0)
+        candidate = self._closest_open_tp_level_index(
+            position,
+            event_trigger if event_trigger > 0 else 0.0,
+        )
+        if candidate is not None:
+            return candidate
 
         event_price = self._extract_event_price(event)
         if event_price <= 0:
             return None
+        return self._closest_open_tp_level_index(position, event_price)
 
+    def _closest_open_tp_level_index(
+        self,
+        position: PositionContext,
+        event_price: float,
+    ) -> int | None:
+        if event_price <= 0:
+            return None
+        best_index: int | None = None
+        best_delta: float | None = None
         for index, level in enumerate(position.tp_levels):
             if level.status == "triggered":
                 continue
-            tolerance = max(abs(level.trigger_price) * 1e-6, 1e-8)
-            if abs(level.trigger_price - event_price) <= tolerance:
-                return index
+            level_price = float(level.trigger_price)
+            if level_price <= 0:
+                continue
+            tolerance = max(
+                abs(level_price) * self.MULTI_TP_MATCH_TOLERANCE_PCT,
+                self.MULTI_TP_MIN_DELTA,
+            )
+            delta = abs(level_price - event_price)
+            if delta > tolerance:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_index = index
+                best_delta = delta
+        return best_index
 
-        return None
+    def _event_matches_triggered_level(
+        self,
+        position: PositionContext,
+        event: dict[str, Any],
+    ) -> bool:
+        """True iff the event's order ids point at a level whose status
+        is already ``triggered`` on this position.
+
+        Used at the top of ``_handle_tp_triggered_event`` to hard-dedup
+        Binance's lifecycle echoes (``TRIGGERED`` → ``FINISHED`` →
+        ORDER_TRADE_UPDATE for the underlying market order = three "fill"
+        events per real TP). Independent of ``_match_tp_level`` so that
+        even an older or future variant of the matcher cannot accidentally
+        route a duplicate event onto the next open TP level.
+        """
+        event_ids = {
+            value
+            for value in (
+                str(event.get("order_id", "")).strip(),
+                str(event.get("client_order_id", "")).strip(),
+            )
+            if value
+        }
+        if not event_ids:
+            return False
+        for level in position.tp_levels:
+            if level.status != "triggered":
+                continue
+            if level.exchange_order_id and str(level.exchange_order_id) in event_ids:
+                return True
+        return False
 
     def _is_duplicate_tp_trigger(self, position: PositionContext, event: dict[str, Any]) -> bool:
-        event_order_id = self._event_order_identifier(event)
-        if event_order_id:
-            return any(
+        event_ids = {
+            value
+            for value in (
+                str(event.get("order_id", "")).strip(),
+                str(event.get("client_order_id", "")).strip(),
+            )
+            if value
+        }
+        if event_ids:
+            if any(
                 level.status == "triggered"
                 and level.exchange_order_id
-                and str(level.exchange_order_id) == event_order_id
+                and str(level.exchange_order_id) in event_ids
                 for level in position.tp_levels
-            )
+            ):
+                return True
 
         event_price = self._extract_event_price(event)
         if event_price <= 0:
@@ -1157,8 +1711,12 @@ class WebSocketManager:
         for level in position.tp_levels:
             if level.status != "triggered":
                 continue
-            tolerance = max(abs(level.trigger_price) * 1e-6, 1e-8)
-            if abs(level.trigger_price - event_price) <= tolerance:
+            level_price = float(level.trigger_price)
+            tolerance = max(
+                abs(level_price) * self.MULTI_TP_MATCH_TOLERANCE_PCT,
+                self.MULTI_TP_MIN_DELTA,
+            )
+            if abs(level_price - event_price) <= tolerance:
                 return True
         return False
 

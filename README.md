@@ -91,6 +91,7 @@ trade_platform/
 - `GET /api/v1/live/auto-trade/state`
 - `GET /api/v1/live/auto-trade/events`
 - `GET /api/v1/live/auto-trade/trades`
+- `POST /api/v1/live/auto-trade/close-positions`
 - `POST /api/v1/analysis/trigger-now`
 - `GET /api/v1/analysis/runs`
 - `GET /api/v1/analysis/runs?limit=1`
@@ -301,6 +302,271 @@ Operational notes:
 - `auto_trade_positions` remains as strategy lifecycle state (open/close/reason/risk context).
 - `exchange_trade_ledger` remains execution truth from exchange.
 - Keep both worker and scheduler running for continuous sync.
+
+Multi-TP SL repositioning (per-level `sl_lock_pct`):
+
+- Each `tp_level` may declare an SL move directive that fires when the level
+  fills. Two equivalent forms:
+  - `sl_lock_pct` (preferred, numeric): signed % of the entry→TP interval to
+    lock as the new SL on the remaining quantity. `0` = breakeven, `50` =
+    halfway, `100` = SL at TP price, `-50` = halfway between entry and the
+    original SL (loosens risk relative to breakeven). Formula:
+    `new_SL = entry + (TP_price − entry) × sl_lock_pct / 100`.
+  - `move_sl_to` (legacy string): `"breakeven"`, `"tpN"` (e.g. `"tp1"`), or
+    `"none"` to opt out of any SL move.
+- Validation is strict at strategy save time: in `tp_mode="multi"`, every
+  level except the last must declare one of the two directives. The literal
+  string `move_sl_to="none"` is the explicit opt-out — leaving both fields
+  null is rejected with HTTP 422 to eliminate the silent-no-op failure mode.
+- **Last-level semantics**: when the final declared TP fires, the position
+  is fully closing — there is nothing left for an SL to protect. The runtime
+  therefore **does not** enqueue a `replace_sl` for the final level even if
+  it carries an `sl_lock_pct` / `move_sl_to` directive (informational only).
+  Instead it emits an `sl_adjustment_skipped` audit event with reason
+  `last_level`, and the WS-manager-side cleanup cancels the remaining
+  conditional orders. This avoids the previous failure mode where the
+  engine enqueued `replace_sl(quantity=0)` against Binance, which is
+  rejected by the LOT_SIZE filter, escalated to an emergency-close that
+  also failed, and raced the synchronous SL cancel — leaving the
+  operator with "TP3 + SL слетели".
+- **Replacement SL is position-attached**: the multi-TP path issues
+  `replace_sl` with `close_position=True`. Binance maps that to
+  `closePosition=true` (no `quantity` / `reduceOnly` fields) and
+  auto-tracks the live position size; Bybit maps it to `tpslMode: "Full"`.
+  Trailing / breakeven / volatility flows pass `close_position=False`
+  explicitly when they need a sliced SL.
+- Run `uv run python -m scripts.audit_strategy_profiles` to list any stored
+  profiles that violate the per-level-directive rule before they are next
+  saved.
+
+Auto-trade restart resilience:
+
+- The FastAPI lifespan now calls `AutoTradeService.hydrate_active_positions`
+  on startup and every 60 s. Open `AutoTradePosition` rows are reloaded into
+  the per-account `WebSocketManager` registry, so TP/SL fills delivered after
+  a restart are routed correctly. Previously the registry was empty after
+  restart and the SL repositioning code path never ran.
+- `WebSocketManager.track_position` proactively kicks off the realtime SL
+  pipeline (kline subscription) for `OPEN` positions that need trailing /
+  breakeven / volatility, so hydrated positions get the same coverage as
+  freshly opened ones.
+
+Auto-trade observability events (`GET /api/v1/live/auto-trade/events`):
+
+- `sl_adjustment_decided` — multi-TP fill triggered an SL move (level, new
+  price, current SL). Info level.
+- `sl_adjustment_skipped` — SL was not moved (reason: `lock_pct_null`,
+  `no_change`, `sl_order_id_missing`, etc.). Warning level.
+- `sl_adjustment_dispatched` — `replace_sl` task enqueued. Info level.
+- `tp_fill_unmatched` — fill event could not be mapped to any TP level. Error
+  level. Includes the full level snapshot for debugging.
+- `multi_tp_inferred_from_position_update` — partial-close reconciler had to
+  synthesize a TP advancement because the order topic did not deliver the
+  fill within `PARTIAL_CLOSE_RECONCILE_DELAY_SECONDS`. Warning level.
+- `order_task_fatal_error` — non-transient adapter failure on a queued order
+  task. Error level. SL/`replace_sl` failures additionally enqueue an
+  `emergency_market_close` so the position is not left unprotected.
+- `strategy_profile_validation_failed` — persisted profile JSON failed
+  validation; per-level config will be dropped at runtime. Error level.
+- `position_manual_closed` — single position flattened via the manual
+  close-positions endpoint. Info level.
+- `position_manual_close_failed` — adapter rejected the manual market
+  close. Error level. Cancels of TP/SL still attempted before the failure.
+- `auto_trade_close_positions_completed` — terminal aggregate event for
+  every manual close-positions invocation, with `closed_count`,
+  `failed_count`, `skipped_count`, and the reason. Info or error level.
+- `multi_tp_duplicate_dispatch_ignored` — `MultiTPEngine.handle_tp_triggered`
+  short-circuited because the level was already triggered or already
+  dispatched (payload `reason: "already_dispatched" | "already_triggered"`).
+  Defence-in-depth against duplicate WS events and concurrent re-entry
+  inside the per-position lock window. Warning level.
+- `sl_adjustment_skipped_position_already_flat` — pre-flight `get_position`
+  reported the exchange position is gone, so no `replace_sl` was enqueued
+  (multi-TP engine) or the queue dropped the in-flight task before it
+  reached the adapter. Emitted instead of `emergency_market_close` when
+  the position has already closed itself. Warning level.
+- `sl_adjustment_skipped_would_trigger_immediately_vs_mark` — the requested
+  SL trigger sits at or beyond the current mark (and clamping would push
+  it below entry). Emitted by the engine pre-flight and by the queue when
+  Binance returns `-2021` / `-4131`. Warning level.
+- `sl_adjustment_clamped_to_safe_distance` — the requested SL trigger was
+  too close to the mark; the engine pushed it 0.1% away from the mark and
+  enqueued the replace anyway (clamped target still protects profit vs
+  entry). Warning level.
+- `emergency_close_skipped_position_flat` — emergency market close was
+  skipped because the live exchange position is flat. Prevents the prod
+  Binance `-2022` "ReduceOnly Order is rejected" loop. Warning level.
+- `replace_sl_coalesced_inflight` — two multi-TP `replace_sl` tasks
+  arrived within the quick-fire window (`0.5s`) for the same position;
+  the queue coalesced them into the latest-intent task. Info level.
+- `cancel_remaining_orders_quiesce_timeout` — `_cancel_remaining_orders`
+  waited up to 2 s for an in-flight `replace_sl` to finish before issuing
+  on-exchange DELETEs but the task did not complete. Error level —
+  operator should inspect whether the position has a duplicate SL.
+
+Manual close-positions flow (`POST /api/v1/live/auto-trade/close-positions`):
+
+- Two-step destructive operation. First request with `confirm: false` (or
+  omitting `confirm`) returns **HTTP 412 Precondition Failed** with a
+  preview body listing every position that would be closed (symbol, side,
+  quantity, entry price, current SL price, count of conditional orders).
+  Nothing changes on the exchange or in the database.
+- Re-send with `confirm: true` to execute. Per position the flow is:
+  1. Cancel every known TP/SL conditional order (best-effort; failures are
+     logged but do not block the close).
+  2. Verify with `get_position`; if the position is already flat on the
+     exchange, mark the DB row CLOSED and skip the market call (idempotent).
+  3. Otherwise issue a market reduce-only close for the live size.
+  4. Mark DB row CLOSED with `close_reason` (defaults to `manual_close`),
+     untrack from the WS manager registry, emit `position_manual_closed`.
+- Failures on individual symbols do not abort the batch — the response
+  surfaces `closed[]`, `failed[]`, `skipped_already_closed[]` so the
+  operator sees the full outcome.
+- Independent from `/auto-trade/stop`: this endpoint does **not** flip
+  `is_running`. Pending signal-queue rows are also left as-is. To both
+  pause new entries and flatten existing positions, call `/stop` and
+  `/close-positions` together.
+- Optional fields in the body: `account_id` (when the user owns multiple
+  configs), `reason` (free-text recorded in the audit event).
+
+Bybit-specific notes:
+
+- All `/v5/position/trading-stop` requests pass `orderLinkId` so subsequent
+  WS execution events (which echo it back as `orderLinkId`) can be matched
+  back to a specific level even when Bybit assigns a different real
+  `orderId`. The WS manager matches against both `order_id` and
+  `client_order_id` from the normalized event.
+- `cancel_and_replace_sl` uses `tpslMode: "Partial"` and explicit `slSize`
+  matching the remaining quantity so the SL targets the correct slice on
+  positions opened with multi-TP (which uses Partial mode).
+- TP level price-match tolerance is `MULTI_TP_MATCH_TOLERANCE_PCT = 0.5%`
+  (was sub-tick precision); the `_match_tp_level` resolver now picks the
+  level with the smallest absolute price delta within tolerance, prefers
+  `event.trigger_price` over fill price, and emits `tp_fill_unmatched` if
+  nothing matches at all.
+
+## W7 — Multi-Strategy Account Partitioning
+
+> Acceptance: ≥3 concurrent strategies on one user **without signal collisions**.
+
+The platform supports multi-strategy trading by binding each strategy to its
+own physical exchange sub-account (its own API key). Physical isolation on
+the exchange side makes signal collisions impossible by construction:
+
+- `AutoTradeConfig.uq_auto_trade_configs_user_account_id` ⇒ 1 strategy per
+  `ExchangeCredential`.
+- `ExchangeCredential.uq_exchange_credentials_user_api_key_hash` ⇒ a user
+  cannot register the same physical sub-account twice. Duplicate api_key
+  uploads return **HTTP 409** with `DuplicateApiKeyError`.
+- Each sub-account has its own balance ⇒ that balance **is** the strategy
+  budget; the exchange itself enforces it. No separate `strategy_budget_usdt`
+  column.
+
+### Setup (operator)
+
+1. **On the exchange**, create N sub-accounts (Binance: master + sub
+   accounts; Bybit: UTA sub-accounts; OKX: sub-accounts). Generate one API
+   key per sub-account and grant futures-trading permissions.
+2. In the platform, register each key via `POST /api/v1/exchange/accounts`
+   with a distinct `account_label` (e.g. `BTC-Scalp`, `ETH-Grid`,
+   `SOL-Intraday`).
+3. Create one `AutoTradeConfig` per credential via
+   `PUT /api/v1/live/auto-trade/config` (the form lets you set a free-text
+   `strategy_name` shown in the multi-strategy switcher).
+4. Use `POST /api/v1/live/auto-trade/play-all` and
+   `POST /api/v1/live/auto-trade/stop-all` for bulk lifecycle.
+
+### W7 endpoints
+
+- `GET /api/v1/live/auto-trade/portfolio` — aggregated view: realized +
+  unrealized PnL across all strategies, per-strategy entry with live USDT
+  balance (parallel fetch, partial failures degrade gracefully into
+  `balance_error`).
+- `POST /api/v1/live/auto-trade/play-all` — flip `is_running=true` on every
+  enabled config. Skips disabled. Returns per-row outcome.
+- `POST /api/v1/live/auto-trade/stop-all` — flip `is_running=false` on every
+  running config. **Does NOT close positions** — use the existing
+  `/auto-trade/close-positions` for that.
+- `GET /api/v1/live/auto-trade/balance?account_id=N` — live USDT balance
+  snapshot for one sub-account. Powers the per-strategy budget card.
+
+### W7 audit events
+
+- `bulk_play_all_invoked` / `bulk_stop_all_invoked` — bulk lifecycle calls.
+- `config_shares_profile_with` — soft warning emitted when two configs
+  reference the same `PersonalAnalysisProfile` (legitimate when mirroring a
+  signal across two sub-accounts, but worth surfacing).
+
+### Budget semantics
+
+`AutoTradeConfig.position_size_usdt` is the **margin** posted per trade, not
+the leveraged notional. The budget card shows `margin_used / sub-account
+balance` with a "margin × Nx = notional" tooltip. Effective exposure at
+leverage *N* is roughly `position_size_usdt × leverage`.
+
+### What we deliberately did NOT do
+
+- ❌ Multiple `AutoTradeConfig` rows per credential (would require dropping
+  the existing UQ and re-introducing the hard collision rule the ТЗ
+  initially proposed; rejected as a slow abstraction).
+- ❌ Per-strategy Taskiq queues. The existing signal queue already isolates
+  per `(history_id, config_id)`, which is sufficient at current load.
+- ❌ Account-level capacity cap. Deferred to W8 Risk Engine.
+
+## Asset Universe — supported symbols
+
+> Acceptance (W7 Asset Expansion): execution of trades on **BTC/USDT and
+> ETH/USDT** end-to-end.
+
+The platform is symbol-agnostic at every layer (models, backtests, exchange
+adapters). The active universe is driven by env-list config rather than
+hard-coded constants, so adding a third symbol (SOL, etc.) is an env tweak
+plus QA, not a code change.
+
+### Env list (in `core/.env`)
+
+- `ANALYSIS_SCHEDULED_SYMBOLS` — comma-separated list of symbols the
+  scheduled-analysis cron iterates each session tick. Default
+  `BTCUSDT,ETHUSDT`. Each cron firing creates one `ScheduledAnalysisRun`
+  per symbol; failures on one symbol do not block the next (sequential
+  `for-of` with try/catch per symbol).
+- `AI_FORECAST_SYMBOLS` — symbols included in the weekly AI Forecast
+  Catalogue rebuild when no explicit `input.symbol` is supplied. Default
+  `BTCUSDT,ETHUSDT`.
+
+### Backend symbol handling
+
+- `PersonalAnalysisProfile.symbol` is `String(24)` — accepts any string
+  the universe defines. No DB-level whitelist.
+- `to_linear_perp_symbol("ETHUSDT") → "ETH/USDT:USDT"` ([signal.py:7-8](app/services/auto_trade/signal.py))
+  via the `_KNOWN_QUOTES = ("USDT", "USDC", "USD", "BTC", "ETH", ...)` tuple.
+- `_get_stale_threshold` ([ws/manager.py:276-281](app/services/ws/manager.py))
+  already has explicit ETH and BTC branches (premium tolerance) so WS
+  staleness detection is identical for both.
+- `position_size_usdt` is **margin**, not notional. ETH at $3,500 with
+  `position_size_usdt=100` requests quantity `0.0286 ETH`. The UI tooltip
+  on the budget card surfaces this distinction.
+
+### Frontend (multi-strategy + multi-asset)
+
+- The strategy switcher (auto-trade dashboard) is keyed by `config_id` so
+  two strategies sharing one sub-account (e.g. BTC-VWAP + ETH-Grid both on
+  Binance-Sub1) remain visually distinct.
+- All scoped GETs (`state`, `positions`, `events`, `trades`, `config`,
+  `balance`, `ai-overlay/config`) accept both `?account_id=` and
+  `?config_id=`. Frontend prefers `config_id` when set.
+
+### Adding a new symbol
+
+1. Add the symbol code (e.g. `SOLUSDT`) to `ANALYSIS_SCHEDULED_SYMBOLS`
+   (and to `AI_FORECAST_SYMBOLS` if needed).
+2. Restart core workers — next session tick begins generating runs for it.
+3. Users create a `PersonalAnalysisProfile` with that `symbol`.
+4. Auto-trade picks it up automatically once the user creates a config
+   pointing at that profile.
+
+No DB migration, no code change, no rollout coordination beyond the env
+list update.
 
 ## Documentation notes (Context7 aligned)
 

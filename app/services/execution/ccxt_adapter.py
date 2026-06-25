@@ -15,6 +15,7 @@ from app.schemas.exchange_trading import (
     FuturesPositionSide,
     NormalizedBalance,
     NormalizedFuturesPosition,
+    NormalizedIncome,
     NormalizedOrder,
     NormalizedTrade,
     OrderSide,
@@ -662,6 +663,56 @@ class CcxtAdapter:
         normalized = [self._normalize_trade(item) for item in raw]
         next_cursor = self._next_futures_trades_cursor(trades=normalized, previous_cursor=cursor)
         return normalized, next_cursor
+
+    async def fetch_futures_income(
+        self,
+        *,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[NormalizedIncome]:
+        # Binance-only: ccxt ``fetch_funding_history`` maps to /fapi/v1/income
+        # with incomeType=FUNDING_FEE. Other venues report funding differently;
+        # they are a no-op here (return nothing) rather than error.
+        if self._credentials.exchange_name != "binance":
+            return []
+        profile = self._ensure_futures_supported()
+        since_ms = int(since.timestamp() * 1000) if since is not None else None
+        params: dict[str, object] = dict(profile.params)
+        async with self._client(
+            default_type=profile.default_type,
+            exchange_id=profile.exchange_id,
+        ) as exchange:
+            raw = await self._call_with_retry(
+                exchange.fetch_funding_history,
+                symbol,
+                since_ms,
+                limit,
+                params,
+            )
+        return [self._normalize_income(item) for item in raw]
+
+    async def fetch_mark_prices(
+        self, *, assets: list[str], quote: str = "USDT"
+    ) -> dict[str, float]:
+        # Best-effort spot last prices for valuing non-quote fees (e.g. BNB).
+        # Per-asset failures are skipped so a missing ticker never breaks PnL.
+        wanted = {asset.upper() for asset in assets if asset and asset.upper() != quote.upper()}
+        if not wanted:
+            return {}
+        result: dict[str, float] = {}
+        async with self._client() as exchange:
+            for asset in wanted:
+                try:
+                    ticker = await self._call_with_retry(
+                        exchange.fetch_ticker, f"{asset}/{quote.upper()}"
+                    )
+                except ExchangeServiceError:
+                    continue
+                last = self._to_float(ticker.get("last"), 0.0)
+                if last > 0:
+                    result[asset] = last
+        return result
 
     @staticmethod
     def _next_futures_trades_cursor(
@@ -1506,5 +1557,37 @@ class CcxtAdapter:
             timestamp=self._to_datetime(
                 payload.get("timestamp") if isinstance(payload.get("timestamp"), int) else None
             ),
+            raw=payload,
+        )
+
+    def _normalize_income(self, payload: dict[str, Any]) -> NormalizedIncome:
+        info = payload.get("info")
+        info_dict: dict[str, Any] = info if isinstance(info, dict) else {}
+
+        tran_raw = info_dict.get("tranId") or payload.get("id")
+        tran_id = str(tran_raw) if tran_raw not in (None, "") else ""
+        trade_raw = info_dict.get("tradeId")
+        trade_id = str(trade_raw) if trade_raw not in (None, "") else None
+        symbol_raw = info_dict.get("symbol") or payload.get("symbol")
+        symbol = str(symbol_raw) if symbol_raw else None
+        info_note = info_dict.get("info")
+        info_str = str(info_note) if info_note not in (None, "") else None
+
+        ts_value = payload.get("timestamp")
+        timestamp_ms: int | None = ts_value if isinstance(ts_value, int) else None
+        if timestamp_ms is None:
+            raw_time = info_dict.get("time")
+            if isinstance(raw_time, (int, str)) and str(raw_time).lstrip("-").isdigit():
+                timestamp_ms = int(raw_time)
+
+        return NormalizedIncome(
+            income_type=str(info_dict.get("incomeType") or "FUNDING_FEE"),
+            asset=str(info_dict.get("asset") or payload.get("code") or ""),
+            income=self._to_float(info_dict.get("income"), self._to_float(payload.get("amount"))),
+            symbol=symbol,
+            tran_id=tran_id,
+            trade_id=trade_id,
+            info=info_str,
+            timestamp=self._to_datetime(timestamp_ms),
             raw=payload,
         )

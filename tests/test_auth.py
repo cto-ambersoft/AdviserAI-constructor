@@ -11,6 +11,18 @@ from app.main import app
 from app.models.base import Base
 
 
+@pytest.fixture(autouse=True)
+def _login_rate_limit_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    # T5's login rate-limiter uses real Redis; force fail-open so signin tests are
+    # deterministic regardless of whether Redis is reachable in the environment.
+    import app.core.ratelimit as rl
+
+    def _down() -> object:
+        raise ConnectionError("redis disabled in tests")
+
+    monkeypatch.setattr(rl, "_get_redis_client", _down)
+
+
 @pytest.fixture
 async def auth_client(tmp_path: Path) -> AsyncIterator[AsyncClient]:
     db_path = tmp_path / "auth_test.db"

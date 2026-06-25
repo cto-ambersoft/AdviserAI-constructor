@@ -143,6 +143,23 @@ class BybitAdapter(ExchangeAdapter):
 
     @classmethod
     def _detect_ccxt_environment(cls, ccxt_exchange: Any) -> Literal["mainnet", "sandbox", "demo"]:
+        """Detect whether a CCXT client is configured for demo, sandbox or mainnet.
+
+        Authoritative signals only:
+
+        - ``options['enableDemoTrading'] is True`` — set by
+          ``ccxt_exchange.enable_demo_trading(True)`` for Bybit demo trading.
+        - ``isSandboxModeEnabled is True`` — set by
+          ``ccxt_exchange.set_sandbox_mode(True)``; this also swaps
+          ``urls['api']`` to ``api-testnet.bybit.com`` endpoints.
+
+        We deliberately do NOT scan ``urls`` for substrings: fresh CCXT
+        ``bybit`` clients carry side-by-side ``urls['test']`` and
+        ``urls['demotrading']`` sub-trees by default, which produced
+        false positives on every real-money client (mirror bug of the
+        Binance variant). See regression test
+        ``test_fresh_real_ccxt_bybit_detects_as_mainnet``.
+        """
         options = getattr(ccxt_exchange, "options", None)
         if isinstance(options, Mapping) and bool(options.get("enableDemoTrading")):
             return "demo"
@@ -151,31 +168,7 @@ class BybitAdapter(ExchangeAdapter):
         if isinstance(sandbox_flag, bool) and sandbox_flag:
             return "sandbox"
 
-        urls = getattr(ccxt_exchange, "urls", None)
-        for candidate in cls._iter_string_values(urls):
-            normalized = candidate.lower()
-            if "api-demo." in normalized or "stream-demo." in normalized:
-                return "demo"
-            if "api-testnet." in normalized or "stream-testnet." in normalized:
-                return "sandbox"
-
         return "mainnet"
-
-    @classmethod
-    def _iter_string_values(cls, value: Any) -> list[str]:
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, Mapping):
-            values: list[str] = []
-            for nested in value.values():
-                values.extend(cls._iter_string_values(nested))
-            return values
-        if isinstance(value, (list, tuple, set)):
-            values = []
-            for nested in value:
-                values.extend(cls._iter_string_values(nested))
-            return values
-        return []
 
     async def _fetch_position_payload(
         self,
@@ -501,8 +494,12 @@ class BybitAdapter(ExchangeAdapter):
         trigger_price: float,
         client_order_id: str,
         reduce_only: bool = True,
+        close_position: bool = False,
     ) -> ConditionalOrderResult:
-        _ = (side, reduce_only)
+        # Bybit's ``tpslMode: "Full"`` is already equivalent to Binance's
+        # ``closePosition=true`` — the SL covers the entire position at
+        # trigger time. The flag is accepted purely for interface parity.
+        _ = (side, reduce_only, close_position)
         trigger_str = await self._price_to_precision(symbol, trigger_price)
         payload = await self._signed_request(
             "POST",
@@ -513,7 +510,13 @@ class BybitAdapter(ExchangeAdapter):
                 "tpslMode": "Full",
                 "stopLoss": trigger_str,
                 "slTriggerBy": "MarkPrice",
+                "slOrderType": "Market",
                 "positionIdx": 0,
+                # Pass our client order id so the resulting Bybit conditional
+                # echoes it back via WS execution events as ``orderLinkId``.
+                # Without this, the only way to map a TP/SL fill to a level is
+                # via price-tolerance heuristics.
+                "orderLinkId": client_order_id,
             },
         )
         return self._conditional_result_from_payload(
@@ -550,6 +553,8 @@ class BybitAdapter(ExchangeAdapter):
             "slSize": qty_str,
             "tpOrderType": tp_order_type,
             "positionIdx": 0,
+            # See place_stop_loss for the rationale on orderLinkId.
+            "orderLinkId": client_order_id,
         }
         if limit_price is not None:
             params["tpLimitPrice"] = await self._price_to_precision(symbol, limit_price)
@@ -601,31 +606,59 @@ class BybitAdapter(ExchangeAdapter):
         new_trigger_price: float,
         new_quantity: float,
         client_order_id: str,
+        close_position: bool = True,
     ) -> ConditionalOrderResult:
+        """Atomically move the position SL to a new trigger price.
+
+        Bybit's ``/v5/position/trading-stop`` mutates the position-level SL,
+        so ``existing_order_id`` is only needed for the rare ``/v5/order/amend``
+        fallback.
+
+        ``close_position=True`` (default) sends ``tpslMode: "Full"`` and omits
+        ``slSize`` so the SL closes whatever position remains at trigger time
+        — matching Binance ``closePosition=true`` semantics. This is the
+        correct mode for multi-TP profiles where partial fills shrink the
+        live position automatically. ``close_position=False`` keeps the
+        legacy ``Partial`` mode plus an explicit ``slSize`` for the
+        trailing/breakeven flows that target a specific slice.
+        """
         trigger_str = await self._price_to_precision(symbol, new_trigger_price)
-        qty_str = await self._amount_to_precision(symbol, new_quantity)
+        request: dict[str, Any] = {
+            "category": "linear",
+            "symbol": self._normalize_symbol(symbol),
+            "stopLoss": trigger_str,
+            "slTriggerBy": "MarkPrice",
+            "slOrderType": "Market",
+            "positionIdx": 0,
+            "orderLinkId": client_order_id,
+        }
+        qty_str: str | None = None
+        if close_position:
+            request["tpslMode"] = "Full"
+        else:
+            qty_str = await self._amount_to_precision(symbol, new_quantity)
+            request["tpslMode"] = "Partial"
+            request["slSize"] = qty_str
         try:
             payload = await self._signed_request(
                 "POST",
                 "/v5/position/trading-stop",
-                {
-                    "category": "linear",
-                    "symbol": self._normalize_symbol(symbol),
-                    "tpslMode": "Full",
-                    "stopLoss": trigger_str,
-                    "slTriggerBy": "MarkPrice",
-                    "positionIdx": 0,
-                },
+                request,
             )
             return self._conditional_result_from_payload(
                 payload=payload,
                 order_type="stop_loss",
                 trigger_price=float(trigger_str),
-                quantity=float(qty_str),
+                quantity=float(qty_str) if qty_str is not None else float(new_quantity),
                 client_order_id=client_order_id,
                 default_exchange_order_id=self._position_tpsl_order_id(symbol, "stop_loss"),
             )
         except BybitAPIError:
+            amend_qty = (
+                qty_str
+                if qty_str is not None
+                else await self._amount_to_precision(symbol, new_quantity)
+            )
             payload = await self._signed_request(
                 "POST",
                 "/v5/order/amend",
@@ -635,14 +668,14 @@ class BybitAdapter(ExchangeAdapter):
                     "orderId": existing_order_id,
                     "orderLinkId": client_order_id,
                     "triggerPrice": trigger_str,
-                    "qty": qty_str,
+                    "qty": amend_qty,
                 },
             )
             return self._conditional_result_from_payload(
                 payload=payload,
                 order_type="stop_loss",
                 trigger_price=float(trigger_str),
-                quantity=float(qty_str),
+                quantity=float(amend_qty),
                 client_order_id=client_order_id,
                 default_exchange_order_id=existing_order_id or client_order_id,
             )

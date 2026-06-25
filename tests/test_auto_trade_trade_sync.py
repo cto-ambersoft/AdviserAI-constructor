@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -178,6 +179,72 @@ async def test_exchange_trade_sync_upserts_and_marks_platform(
             assert inserted_second == 0
             count = int((await session.scalar(select(func.count(ExchangeTradeLedger.id)))) or 0)
             assert count == 1
+    finally:
+        await engine.dispose()
+
+
+class _RealizedFakeTradingService:
+    """Returns one closing fill carrying Binance ``info.realizedPnl``."""
+
+    def __init__(self, realized: str) -> None:
+        self.realized = realized
+        self.page_calls = 0
+
+    async def fetch_futures_trades_page(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> tuple[list[NormalizedTrade], str | None]:
+        self.page_calls += 1
+        if self.page_calls > 1:
+            return [], None
+        trade = NormalizedTrade(
+            id="trade-1",
+            order_id="ord-1",
+            symbol=symbol,
+            side="sell",
+            amount=0.5,
+            price=120.0,
+            cost=60.0,
+            fee_cost=0.02,
+            fee_currency="USDT",
+            timestamp=datetime.now(UTC),
+            raw={"clientOrderId": "cid-1", "info": {"realizedPnl": self.realized}},
+        )
+        return [trade], "trade-1"
+
+
+async def test_sync_writes_and_updates_realized_pnl(tmp_path: Path) -> None:
+    db_path = tmp_path / "realized_sync.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    session_factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    try:
+        async with session_factory() as session:
+            _user, _account, config = await _seed_core(session)
+            fake = _RealizedFakeTradingService(realized="12.5")
+            service = ExchangeTradeSyncService(trading_service=fake)
+
+            # First sync writes the authoritative realized_pnl from raw_trade.
+            await service.sync_config_trades(session=session, config=config)
+            row = (await session.scalars(select(ExchangeTradeLedger))).one()
+            assert row.realized_pnl == pytest.approx(12.5)
+
+            # Re-syncing the same fill with a corrected realizedPnl updates the
+            # column — proving realized_pnl is in the upsert update set.
+            fake.realized = "20.0"
+            fake.page_calls = 0
+            await service.sync_config_trades(session=session, config=config)
+            await session.refresh(row)
+            assert row.realized_pnl == pytest.approx(20.0)
     finally:
         await engine.dispose()
 

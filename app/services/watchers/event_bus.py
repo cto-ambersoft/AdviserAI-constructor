@@ -12,6 +12,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 
+from app.core.config import get_settings
 from app.services.exchange.adapter import OrderSide
 from app.services.position.order_queue import OrderPriority, OrderTask
 from app.services.watchers.indicator_watcher import WatcherEvent
@@ -103,8 +104,36 @@ def _closing_order_side(raw_side: str) -> OrderSide:
     return OrderSide.SELL
 
 
+async def _claim_trigger(event: WatcherEvent) -> bool:
+    """Per-(position, indicator, action) cooldown (review I4).
+
+    Returns ``True`` if the trigger may proceed (claimed), ``False`` if a recent
+    identical trigger is still within the cooldown window — so a persistent
+    condition doesn't re-adjust SL / partial-close every tick. Fail-OPEN on Redis
+    error (proceed): never silently drop a safety action because Redis blipped.
+    """
+    ttl = get_settings().watcher_trigger_cooldown_seconds
+    if ttl <= 0:
+        return True
+    key = f"watcher:cooldown:{event.position_id}:{event.indicator}:{event.action}"
+    try:
+        async with _get_redis_client() as redis:
+            claimed = await redis.set(key, "1", nx=True, ex=ttl)
+            return bool(claimed)
+    except Exception:
+        logger.debug("watcher cooldown unavailable (Redis); allowing trigger")
+        return True
+
+
 async def handle_watcher_event(event: WatcherEvent) -> None:
     """Route watcher actions to the order queue or notification stub."""
+    if event.action in ("tighten_sl", "close_partial") and not await _claim_trigger(event):
+        logger.debug(
+            "watcher trigger within cooldown; skipping %s for position %s",
+            event.action,
+            event.position_id,
+        )
+        return
     position = await load_position_context(event.position_id)
 
     if event.action == "tighten_sl":

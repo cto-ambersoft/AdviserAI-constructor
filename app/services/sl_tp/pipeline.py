@@ -49,19 +49,16 @@ class SLAdjustmentPipeline:
         indicators: dict[str, Any],
     ) -> Optional[SLAdjustmentResult]:
         if source == "watcher":
-            return await self._evaluate_watcher_rules(indicators)
+            # Watcher-triggered SL moves are applied via the event bus
+            # (indicator_watcher → Redis → the runtime's watcher-event consumer →
+            # handle_watcher_event), NOT this priority pipeline. The slot is a
+            # deliberate no-op so a config that lists "watcher" in its
+            # adjustment_priority resolves cleanly instead of erroring.
+            return None
         if source == "trailing":
             return evaluate_trailing(self.position, current_price)
         if source == "breakeven":
             return evaluate_breakeven(self.position, current_price)
         if source == "volatility":
             return evaluate_volatility(self.position, indicators.get("ATR"))
-        return None
-
-    async def _evaluate_watcher_rules(
-        self,
-        indicators: dict[str, Any],
-    ) -> Optional[SLAdjustmentResult]:
-        """Watcher placeholder for future phases."""
-        del indicators
         return None

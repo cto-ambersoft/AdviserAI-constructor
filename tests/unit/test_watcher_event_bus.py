@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import app.services.watchers.event_bus as event_bus_mod  # noqa: E402
+from app.core.config import get_settings  # noqa: E402
 from app.services.position.context import PositionContext, PositionSide  # noqa: E402
 from app.services.watchers.event_bus import (  # noqa: E402
     WATCHER_EVENT_CHANNEL,
@@ -22,6 +24,14 @@ from app.services.watchers.event_bus import (  # noqa: E402
     subscribe_watcher_events,
 )
 from app.services.watchers.indicator_watcher import WatcherEvent  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_trigger_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    # I4 added a per-trigger Redis cooldown (ttl>0). Disable it (ttl=0) so the
+    # routing tests are deterministic regardless of Redis. The dedup test re-enables
+    # it with a fake Redis.
+    monkeypatch.setattr(get_settings(), "watcher_trigger_cooldown_seconds", 0)
 
 
 class _FakePubSub:
@@ -272,3 +282,46 @@ async def test_handle_watcher_event_alert_uses_notification_stub(
     await handle_watcher_event(_event(action="alert", current_value=77.0, action_params={}))
 
     notification.assert_awaited_once()
+
+
+class _CooldownRedis:
+    """SET NX EX semantics: first claim succeeds, repeats return None."""
+
+    def __init__(self) -> None:
+        self._keys: set[str] = set()
+
+    async def __aenter__(self) -> _CooldownRedis:
+        return self
+
+    async def __aexit__(self, *_: object) -> bool:
+        return False
+
+    async def set(self, key: str, value: str, nx: bool = False, ex: int | None = None) -> object:
+        if nx and key in self._keys:
+            return None
+        self._keys.add(key)
+        return True
+
+
+async def test_claim_trigger_dedups_within_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    # I4: a persistent condition (same position/indicator/action) is claimed once;
+    # repeats within the cooldown window are skipped.
+    monkeypatch.setattr(get_settings(), "watcher_trigger_cooldown_seconds", 300)
+    shared = _CooldownRedis()
+    monkeypatch.setattr(event_bus_mod, "_get_redis_client", lambda: shared)
+
+    evt = _event(action="tighten_sl")
+    assert await event_bus_mod._claim_trigger(evt) is True
+    assert await event_bus_mod._claim_trigger(evt) is False  # within cooldown
+    # a different action on the same position is independent
+    assert await event_bus_mod._claim_trigger(_event(action="close_partial")) is True
+
+
+async def test_claim_trigger_fails_open_on_redis_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(get_settings(), "watcher_trigger_cooldown_seconds", 300)
+
+    def _boom() -> object:
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(event_bus_mod, "_get_redis_client", _boom)
+    assert await event_bus_mod._claim_trigger(_event(action="tighten_sl")) is True

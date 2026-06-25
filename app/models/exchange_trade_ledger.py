@@ -83,6 +83,11 @@ class ExchangeTradeLedger(Base):
     cost: Mapped[float | None] = mapped_column(Float(), nullable=True)
     fee_cost: Mapped[float] = mapped_column(Float(), nullable=False, default=0.0)
     fee_currency: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Authoritative gross realized PnL of the fill as reported by the exchange
+    # (Binance ``realizedPnl``: price PnL only, excludes commission/funding).
+    # Nullable: legacy/external fills that did not carry the field stay NULL and
+    # fall back to FIFO price-based realized in the PnL engine.
+    realized_pnl: Mapped[float | None] = mapped_column(Float(), nullable=True)
     traded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     origin: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")

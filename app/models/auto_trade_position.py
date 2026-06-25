@@ -94,6 +94,16 @@ class AutoTradePosition(Base, TimestampMixin):
         nullable=True,
         index=True,
     )
+    # W2 traceability: id of the canonical AI decision document in core's
+    # ai_decision_events collection that drove this entry. Nullable because
+    # positions opened without an active overlay (or with overlay snapshot
+    # missing the field) won't carry the link. Not a Postgres FK — the
+    # referenced id lives in MongoDB.
+    decision_event_id: Mapped[str | None] = mapped_column(
+        String(36),
+        nullable=True,
+        index=True,
+    )
     raw_open_order: Mapped[dict[str, object]] = mapped_column(JSON(), nullable=False, default=dict)
     raw_close_order: Mapped[dict[str, object]] = mapped_column(JSON(), nullable=False, default=dict)
 

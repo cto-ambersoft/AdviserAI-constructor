@@ -145,8 +145,17 @@ class _FakeExchangeAdapter(ExchangeAdapter):
         trigger_price: float,
         client_order_id: str,
         reduce_only: bool = True,
+        close_position: bool = False,
     ) -> ConditionalOrderResult:
         _ = (side, reduce_only)
+        # Mirror Binance's actual rejection: ``reduceOnly + quantity=0``
+        # never makes it past the LOT_SIZE filter. We must surface it as a
+        # transient failure so the qty=0 regression test fails loudly if
+        # the engine ever enqueues such a task again.
+        if quantity <= 0 and not close_position:
+            raise TransientExchangeError(
+                "simulated LOT_SIZE rejection for quantity=0"
+            )
         if self.stop_loss_failures_remaining > 0:
             self.stop_loss_failures_remaining -= 1
             raise TransientExchangeError("simulated stop-loss placement failure")
@@ -202,17 +211,23 @@ class _FakeExchangeAdapter(ExchangeAdapter):
         new_trigger_price: float,
         new_quantity: float,
         client_order_id: str,
+        close_position: bool = True,
     ) -> ConditionalOrderResult:
         if self.replace_sl_failures_remaining > 0:
             self.replace_sl_failures_remaining -= 1
             raise TransientExchangeError("simulated stop-loss replacement failure")
 
         self.mark_order_closed(symbol, existing_order_id)
+        # ``close_position=True`` mirrors Binance's quantity-agnostic mode —
+        # mark the registered order's quantity as 0 to make that explicit
+        # (Binance ignores qty when ``closePosition=true``). The fixed-qty
+        # path (trailing/breakeven) keeps the explicit slice.
+        recorded_qty = 0.0 if close_position else new_quantity
         return self._register_order(
             symbol=symbol,
             order_type="stop_loss",
             trigger_price=new_trigger_price,
-            quantity=new_quantity,
+            quantity=recorded_qty,
             client_order_id=client_order_id,
         )
 
@@ -807,6 +822,105 @@ async def test_sl_placement_failure_escalates_to_emergency_close() -> None:
         assert harness.adapter.partial_close_calls[0]["order_type"] == "market"
     finally:
         monkeypatch.undo()
+        await harness.stop()
+
+
+@pytest.mark.asyncio
+async def test_three_tp_lifecycle_does_not_emit_zero_qty_replace_sl() -> None:
+    """Regression: the multi-TP "TP3 + SL слетели" cluster.
+
+    With the old code, on the final TP fill the engine zeroed
+    ``current_quantity`` and then enqueued ``replace_sl`` with
+    ``new_quantity=0``. The adapter's qty=0 LOT_SIZE rejection caused four
+    failed retries → fatal-error path → ``emergency_market_close`` (which
+    also failed), and the WS-manager-side cleanup cancelled the live SL
+    in parallel. The user observed "TP3 and SL flew off".
+
+    This test asserts the new behaviour:
+
+    - ``cancel_and_replace_sl`` is invoked exactly twice (after TP1 and
+      after TP2), and never with ``new_quantity=0``.
+    - ``place_stop_loss`` is never called with ``quantity=0`` AND
+      ``close_position=False`` (the combination the simulated adapter
+      rejects with LOT_SIZE).
+    - The audit feed contains exactly one ``sl_adjustment_skipped`` with
+      reason ``last_level`` for the final fill.
+    - ``order_task_fatal_error`` does not appear in the audit feed.
+    """
+    from app.services import audit as auto_trade_audit
+
+    harness = _LifecycleHarness()
+    await harness.start()
+
+    captured_audit: list[tuple[str, dict[str, Any]]] = []
+
+    async def _hook(event_type: str, payload: dict[str, Any]) -> None:
+        captured_audit.append((event_type, payload))
+
+    auto_trade_audit.set_audit_hook(_hook)
+
+    # Spy on cancel_and_replace_sl call sites without breaking the harness.
+    real_replace_sl = harness.adapter.cancel_and_replace_sl
+    replace_sl_calls: list[dict[str, Any]] = []
+
+    async def _spy_replace_sl(**kwargs: Any) -> Any:
+        replace_sl_calls.append(dict(kwargs))
+        return await real_replace_sl(**kwargs)
+
+    harness.adapter.cancel_and_replace_sl = _spy_replace_sl  # type: ignore[method-assign]
+
+    try:
+        position = _build_multi_tp_position()
+        harness.track_position(position)
+        await harness.place_initial_protection(position)
+
+        for level_index, qty in enumerate([0.33, 0.33, 0.34]):
+            await harness.emit_order(
+                {
+                    "symbol": _event_symbol(position.symbol),
+                    "event_type": "ALGO_UPDATE",
+                    "order_type": "take_profit",
+                    "status": "triggered",
+                    "order_id": position.tp_levels[level_index].exchange_order_id,
+                    "trigger_price": position.tp_levels[level_index].trigger_price,
+                    "filled_quantity": qty,
+                }
+            )
+            await harness.drain()
+
+        # 1. Replace_sl was called exactly twice (after TP1 and TP2),
+        #    never on TP3.
+        assert len(replace_sl_calls) == 2, (
+            f"expected 2 replace_sl calls (TP1, TP2), got "
+            f"{len(replace_sl_calls)}: {replace_sl_calls!r}"
+        )
+        # 2. Neither call carried qty=0 with close_position=False.
+        for call in replace_sl_calls:
+            qty = float(call.get("new_quantity", 0))
+            close_pos = bool(call.get("close_position", True))
+            assert qty > 0 or close_pos, (
+                f"replace_sl call would be rejected by Binance LOT_SIZE: "
+                f"qty={qty} close_position={close_pos}"
+            )
+        # 3. Exactly one sl_adjustment_skipped with reason last_level.
+        last_level_skips = [
+            payload
+            for event_type, payload in captured_audit
+            if event_type == "sl_adjustment_skipped"
+            and payload.get("reason") == "last_level"
+        ]
+        assert len(last_level_skips) == 1, (
+            f"expected one sl_adjustment_skipped/last_level, got "
+            f"{[p for et, p in captured_audit if et == 'sl_adjustment_skipped']!r}"
+        )
+        # 4. No fatal-error audit emitted.
+        fatal = [event for event, _ in captured_audit if event == "order_task_fatal_error"]
+        assert not fatal, f"unexpected fatal events: {fatal!r}"
+        # 5. Position closed cleanly.
+        assert position.state == PositionState.CLOSED
+        assert position.current_quantity == pytest.approx(0.0)
+    finally:
+        auto_trade_audit.set_audit_hook(None)
         await harness.stop()
 
 

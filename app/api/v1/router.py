@@ -10,19 +10,25 @@ from app.api.v1.endpoints import (
     audit,
     auth,
     backtest,
+    events,
     exchange,
     health,
     internal_backtest,
+    internal_outcomes,
     live,
     market,
     personal_analysis,
     strategies,
+    telegram_webhook,
 )
 
 api_router = APIRouter()
 api_router.include_router(health.router, tags=["health"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(internal_backtest.router, prefix="/internal", tags=["internal"])
+api_router.include_router(internal_outcomes.router, prefix="/internal", tags=["internal"])
+# Public, unauthenticated — Telegram calls this; secured by path + header secret.
+api_router.include_router(telegram_webhook.router, tags=["telegram"])
 
 protected_router = APIRouter(dependencies=[Depends(get_current_user)])
 protected_router.include_router(strategies.router, prefix="/strategies", tags=["strategies"])
@@ -33,6 +39,7 @@ protected_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 protected_router.include_router(market.router, prefix="/market", tags=["market"])
 protected_router.include_router(accounts.router, prefix="/accounts", tags=["accounts"])
 protected_router.include_router(live.router, prefix="/live", tags=["live"])
+protected_router.include_router(events.router, tags=["events"])
 protected_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 protected_router.include_router(
     ai_backtests.router,

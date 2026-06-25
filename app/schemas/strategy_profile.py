@@ -58,11 +58,14 @@ class StrategyProfileTPLevel(BaseModel):
         if value is None:
             return None
         normalized = value.strip().lower()
-        if normalized == "breakeven":
+        if normalized in {"breakeven", "none"}:
             return normalized
         if _MOVE_SL_TO_TP_RE.fullmatch(normalized) is not None:
             return normalized
-        raise ValueError("move_sl_to must be null, 'breakeven', or a tp reference like 'tp1'.")
+        raise ValueError(
+            "move_sl_to must be null, 'breakeven', 'none' (explicit no-op), "
+            "or a tp reference like 'tp1'."
+        )
 
 
 class StrategyProfileWatcher(BaseModel):
@@ -175,6 +178,17 @@ class StrategyProfileConfig(BaseModel):
             raise ValueError(
                 "tp_levels close_pct must sum to 100% (+/- 0.1) when tp_mode='multi'."
             )
+
+        # Force explicit SL semantics for every non-final level. Leaving both
+        # ``sl_lock_pct`` and ``move_sl_to`` null silently skips SL movement
+        # — that is the exact failure mode users have hit ("TP fired, SL
+        # didn't move"). Set ``move_sl_to='none'`` to opt out explicitly.
+        for index, level in enumerate(self.tp_levels[:-1], start=1):
+            if level.sl_lock_pct is None and level.move_sl_to is None:
+                raise ValueError(
+                    f"Multi-TP level {index} must declare sl_lock_pct or "
+                    f"move_sl_to (use 'none' to keep SL fixed)."
+                )
         return self
 
 

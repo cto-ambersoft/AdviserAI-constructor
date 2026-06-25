@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,7 +11,9 @@ from app.api.deps import get_current_user
 from app.api.v1.endpoints.live import auto_trade_service
 from app.db.session import get_db_session
 from app.main import app
+from app.models.agent_freshness_status import AgentFreshnessStatus
 from app.models.auto_trade_config import AutoTradeConfig
+from app.models.auto_trade_event import AutoTradeEvent
 from app.models.auto_trade_position import AutoTradePosition
 from app.models.base import Base
 from app.models.exchange import ExchangeCredential
@@ -413,6 +415,376 @@ async def test_auto_trade_config_endpoint_round_trips_strategy_profile(
         assert fetched_body["strategy_profile"] == created_body["strategy_profile"]
 
 
+async def test_auto_trade_config_endpoint_round_trips_risk_config(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 3,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+                "risk": {
+                    "daily_loss_limit_usdt": 50.0,
+                    "max_open_positions": 3,
+                    "exposure_cap_usdt": 500.0,
+                    "leverage_ceiling": 5,
+                    "kpi_guard_enabled": True,
+                    "kpi_guard_max_dd_pct": 25.0,
+                    "kpi_guard_max_daily_loss_usdt": 75.0,
+                    "kpi_guard_min_win_rate_pct": 40.0,
+                    "kpi_guard_min_trades": 20,
+                    "kill_switch_enabled": True,
+                    "kill_switch_atr_spike_mult": 3.0,
+                    "kill_switch_atr_period": 14,
+                    "kill_switch_price_move_pct": 5.0,
+                    "kill_switch_cooldown_seconds": 30,
+                },
+            },
+        )
+        assert created.status_code == 200
+        created_risk = created.json()["risk"]
+        assert created_risk is not None
+        assert created_risk["daily_loss_limit_usdt"] == 50.0
+        assert created_risk["max_open_positions"] == 3
+        assert created_risk["enabled"] is True
+        assert created_risk["conflicting_signal_policy"] == "off"
+        # W9 T1.1 — KPI-Guard thresholds round-trip through the same upsert route.
+        assert created_risk["kpi_guard_enabled"] is True
+        assert created_risk["kpi_guard_max_dd_pct"] == 25.0
+        assert created_risk["kpi_guard_max_daily_loss_usdt"] == 75.0
+        assert created_risk["kpi_guard_max_daily_loss_pct"] is None
+        assert created_risk["kpi_guard_min_win_rate_pct"] == 40.0
+        assert created_risk["kpi_guard_min_trades"] == 20
+        # W9 T2.1 — Kill-Switch thresholds round-trip too.
+        assert created_risk["kill_switch_enabled"] is True
+        assert created_risk["kill_switch_atr_spike_mult"] == 3.0
+        assert created_risk["kill_switch_atr_period"] == 14
+        assert created_risk["kill_switch_price_move_pct"] == 5.0
+        assert created_risk["kill_switch_cooldown_seconds"] == 30
+
+        fetched = await client.get("/api/v1/live/auto-trade/config")
+        assert fetched.status_code == 200
+        assert fetched.json()["risk"] == created_risk
+
+
+async def test_auto_trade_config_endpoint_rejects_invalid_conflicting_signal_policy(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+                "risk": {"conflicting_signal_policy": "bogus"},
+            },
+        )
+        assert resp.status_code == 422
+
+
+async def test_auto_trade_config_endpoint_rejects_kpi_guard_out_of_bounds(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """W9 T1.1 — out-of-bound KPI-Guard thresholds are rejected at the API edge (422)."""
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+                "risk": {"kpi_guard_enabled": True, "kpi_guard_max_dd_pct": 150.0},
+            },
+        )
+        assert resp.status_code == 422
+
+
+async def test_auto_trade_config_endpoint_rejects_kill_switch_out_of_bounds(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """W9 T2.1 — out-of-bound Kill-Switch thresholds are rejected at the API edge (422)."""
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+                "risk": {"kill_switch_enabled": True, "kill_switch_atr_spike_mult": 1.0},
+            },
+        )
+        assert resp.status_code == 422
+
+
+async def test_strategy_health_endpoint_returns_metrics(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+            },
+        )
+        assert created.status_code == 200
+        config_id = created.json()["id"]
+
+    now = datetime.now(UTC)
+    async with auto_trade_endpoints_db() as session:
+        for idx in range(12):
+            session.add(
+                AutoTradePosition(
+                    user_id=1,
+                    config_id=config_id,
+                    profile_id=profile_id,
+                    account_id=account_id,
+                    symbol="BTC/USDT:USDT",
+                    side="LONG",
+                    status="closed",
+                    entry_price=100.0,
+                    quantity=1.0,
+                    position_size_usdt=100.0,
+                    leverage=1,
+                    tp_price=102.0,
+                    sl_price=99.0,
+                    entry_confidence_pct=70.0,
+                    opened_at=now - timedelta(hours=2),
+                    closed_at=now - timedelta(hours=1, minutes=idx),
+                    close_reason="tp",
+                    close_price=110.0,
+                    open_order_id=f"o{idx}",
+                    close_order_id=f"c{idx}",
+                    raw_open_order={},
+                    raw_close_order={},
+                )
+            )
+        await session.commit()
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            f"/api/v1/live/auto-trade/strategies/{config_id}/health?window_days=30"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["config_id"] == config_id
+        assert body["window_days"] == 30
+        assert body["sample_size"] == 12
+        assert body["win_rate_pct"] == 100.0  # all 12 closed as wins
+        # roi_pct (W9 T0.1): 12 wins x +10 = +120 PnL on a 100 USDT base ⇒ 120%.
+        assert body["roi_pct"] == pytest.approx(120.0)
+        assert 0.0 <= body["health_score"] <= 100.0
+        assert body["health_class"] in {"healthy", "warning", "critical"}
+
+        missing = await client.get("/api/v1/live/auto-trade/strategies/999999/health")
+        assert missing.status_code == 404
+
+
+async def test_position_trace_endpoint_returns_signal_to_close_timeline(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """W9 T3.1 — the trace returns the position metadata + its events in
+    chronological (signal→close) order; unknown position ⇒ 404."""
+    profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.put(
+            "/api/v1/live/auto-trade/config",
+            json={
+                "enabled": True,
+                "profile_id": profile_id,
+                "account_id": account_id,
+                "position_size_usdt": 100.0,
+                "leverage": 1,
+                "min_confidence_pct": 62.0,
+                "fast_close_confidence_pct": 80.0,
+                "confirm_reports_required": 2,
+                "risk_mode": "1:2",
+                "sl_pct": 1.0,
+                "tp_pct": 2.0,
+            },
+        )
+        assert created.status_code == 200
+        config_id = created.json()["id"]
+
+    now = datetime.now(UTC)
+    async with auto_trade_endpoints_db() as session:
+        position = AutoTradePosition(
+            user_id=1,
+            config_id=config_id,
+            profile_id=profile_id,
+            account_id=account_id,
+            symbol="BTC/USDT:USDT",
+            side="LONG",
+            status="closed",
+            entry_price=100.0,
+            quantity=1.0,
+            position_size_usdt=100.0,
+            leverage=1,
+            tp_price=102.0,
+            sl_price=99.0,
+            entry_confidence_pct=70.0,
+            opened_at=now - timedelta(hours=2),
+            closed_at=now - timedelta(hours=1),
+            close_reason="volatility_kill_switch",
+            close_price=92.0,
+            open_order_id="o-1",
+            close_order_id="c-1",
+            decision_event_id="dec-abc-123",
+            raw_open_order={},
+            raw_close_order={},
+        )
+        session.add(position)
+        await session.flush()
+        pid = position.id
+        timeline = [
+            ("position_opened", now - timedelta(hours=2)),
+            ("kill_switch_triggered", now - timedelta(hours=1, minutes=5)),
+            ("position_manual_closed", now - timedelta(hours=1)),
+        ]
+        for event_type, created_at in timeline:
+            session.add(
+                AutoTradeEvent(
+                    user_id=1,
+                    config_id=config_id,
+                    position_id=pid,
+                    event_type=event_type,
+                    level="info",
+                    message=None,
+                    payload={},
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+        await session.commit()
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/api/v1/live/auto-trade/positions/{pid}/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["position_id"] == pid
+        assert body["symbol"] == "BTC/USDT:USDT"
+        assert body["status"] == "closed"
+        assert body["close_reason"] == "volatility_kill_switch"
+        assert body["decision_event_id"] == "dec-abc-123"
+        assert body["open_order_id"] == "o-1"
+        assert body["close_order_id"] == "c-1"
+        # Chronological signal→close ordering.
+        assert [e["event_type"] for e in body["events"]] == [
+            "position_opened",
+            "kill_switch_triggered",
+            "position_manual_closed",
+        ]
+
+        missing = await client.get("/api/v1/live/auto-trade/positions/999999/trace")
+        assert missing.status_code == 404
+
+
+async def test_agent_freshness_endpoint_filters_by_is_fresh(
+    auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
+) -> None:
+    profile_id, _account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
+    now = datetime.now(UTC)
+    async with auto_trade_endpoints_db() as session:
+        session.add(
+            AgentFreshnessStatus(
+                profile_id=profile_id,
+                symbol="BTCUSDT",
+                agent_key="__profile__",
+                last_data_at=now - timedelta(minutes=10),
+                age_minutes=10,
+                is_fresh=True,
+                checked_at=now,
+            )
+        )
+        session.add(
+            AgentFreshnessStatus(
+                profile_id=profile_id,
+                symbol="BTCUSDT",
+                agent_key="news",
+                last_data_at=now - timedelta(minutes=500),
+                age_minutes=500,
+                is_fresh=False,
+                checked_at=now,
+            )
+        )
+        await session.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        all_resp = await client.get("/api/v1/health/agents")
+        assert all_resp.status_code == 200
+        assert len(all_resp.json()["statuses"]) == 2
+
+        fresh_resp = await client.get("/api/v1/health/agents?is_fresh=true")
+        assert fresh_resp.status_code == 200
+        fresh = fresh_resp.json()["statuses"]
+        assert len(fresh) == 1
+        assert fresh[0]["agent_key"] == "__profile__"
+        assert fresh[0]["is_fresh"] is True
+
+        stale_resp = await client.get("/api/v1/health/agents?is_fresh=false")
+        assert stale_resp.status_code == 200
+        stale = stale_resp.json()["statuses"]
+        assert len(stale) == 1
+        assert stale[0]["agent_key"] == "news"
+        assert stale[0]["age_minutes"] == 500
+
+
 async def test_auto_trade_config_endpoint_preserves_strategy_profile_when_omitted(
     auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -616,9 +988,18 @@ async def test_auto_trade_config_validates_profile_and_account_ownership(
         assert bad_account.status_code == 404
 
 
-async def test_auto_trade_config_rejects_profile_account_change_while_running(
+async def test_auto_trade_config_put_on_new_account_creates_second_strategy(
     auto_trade_endpoints_db: async_sessionmaker[AsyncSession],
 ) -> None:
+    """W7 semantics: PUT with a different ``account_id`` creates a NEW
+    strategy on that sub-account rather than mutating the running config.
+
+    Replaces the earlier guard that rejected this scenario as "cannot
+    change profile_id/account_id while running"; under the multi-strategy
+    model each ``(user, account_id)`` is its own strategy slot, so adding
+    a second slot is a legitimate operation, not a rename of the first.
+    """
+
     profile_id, account_id = await _seed_profile_and_account(auto_trade_endpoints_db)
     profile2_id, account2_id = await _seed_second_profile_and_account_for_user1(
         auto_trade_endpoints_db
@@ -642,11 +1023,14 @@ async def test_auto_trade_config_rejects_profile_account_change_while_running(
             },
         )
         assert create_response.status_code == 200
+        first_id = create_response.json()["id"]
 
-        play_response = await client.post("/api/v1/live/auto-trade/play")
+        play_response = await client.post(
+            "/api/v1/live/auto-trade/play", params={"account_id": account_id}
+        )
         assert play_response.status_code == 200
 
-        update_response = await client.put(
+        second_response = await client.put(
             "/api/v1/live/auto-trade/config",
             json={
                 "enabled": True,
@@ -662,7 +1046,19 @@ async def test_auto_trade_config_rejects_profile_account_change_while_running(
                 "tp_pct": 2.0,
             },
         )
-        assert update_response.status_code == 422
+        assert second_response.status_code == 200
+        second_id = second_response.json()["id"]
+        assert second_id != first_id
+
+        # The original (running) config is untouched.
+        listing = await client.get("/api/v1/live/auto-trade/configs")
+        assert listing.status_code == 200
+        body = listing.json()
+        configs_by_id = {c["id"]: c for c in body["configs"]}
+        assert configs_by_id[first_id]["is_running"] is True
+        assert configs_by_id[first_id]["account_id"] == account_id
+        assert configs_by_id[second_id]["is_running"] is False
+        assert configs_by_id[second_id]["account_id"] == account2_id
 
 
 async def test_auto_trade_endpoints_require_account_scope_when_multiple_configs_exist(

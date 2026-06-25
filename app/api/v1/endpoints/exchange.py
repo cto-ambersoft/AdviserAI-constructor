@@ -1,33 +1,19 @@
 from fastapi import APIRouter, HTTPException, status
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, RequireStepUp
 from app.schemas.exchange import (
     ExchangeAccountCreate,
     ExchangeAccountRead,
     ExchangeAccountsMetaResponse,
     ExchangeAccountUpdate,
     ExchangeAccountValidateResponse,
-    ExchangeSecretIn,
-    ExchangeSecretOut,
 )
 from app.schemas.exchange_trading import SUPPORTED_EXCHANGE_MODES, SUPPORTED_EXCHANGES
 from app.services.exchange_credentials.service import ExchangeCredentialsService
 from app.services.execution.errors import ExchangeServiceError, error_http_status
-from app.services.secrets import SecretsService
 
 router = APIRouter()
-secrets_service = SecretsService()
 credentials_service = ExchangeCredentialsService()
-
-
-@router.post("/encrypt", response_model=ExchangeSecretOut, summary="Encrypt exchange secrets")
-async def encrypt_exchange_secrets(payload: ExchangeSecretIn) -> ExchangeSecretOut:
-    encrypted = secrets_service.encrypt_credentials(
-        api_key=payload.api_key,
-        api_secret=payload.api_secret,
-        passphrase=payload.passphrase,
-    )
-    return ExchangeSecretOut.model_validate(encrypted)
 
 
 @router.get(
@@ -57,7 +43,7 @@ async def list_exchange_accounts(
 async def create_exchange_account(
     payload: ExchangeAccountCreate,
     session: DbSession,
-    current_user: CurrentUser,
+    current_user: RequireStepUp,
 ) -> ExchangeAccountRead:
     try:
         return await credentials_service.create_account(session, payload, user_id=current_user.id)
@@ -72,7 +58,7 @@ async def update_exchange_account(
     account_id: int,
     payload: ExchangeAccountUpdate,
     session: DbSession,
-    current_user: CurrentUser,
+    current_user: RequireStepUp,
 ) -> ExchangeAccountRead:
     try:
         return await credentials_service.update_account(
@@ -93,7 +79,7 @@ async def update_exchange_account(
     summary="Delete exchange account",
 )
 async def delete_exchange_account(
-    account_id: int, session: DbSession, current_user: CurrentUser
+    account_id: int, session: DbSession, current_user: RequireStepUp
 ) -> None:
     deleted = await credentials_service.delete_account(
         session, account_id=account_id, user_id=current_user.id

@@ -17,6 +17,8 @@ from app.models.personal_analysis_profile import PersonalAnalysisProfile
 from app.models.refresh_token import RefreshToken
 from app.models.snapshot import StrategySnapshot
 from app.models.strategy import Strategy
+from app.models.telegram_notification_delivery import TelegramNotificationDelivery
+from app.models.telegram_notification_settings import TelegramNotificationSettings
 from app.models.user import User
 
 __all__ = [
@@ -40,4 +42,6 @@ __all__ = [
     "PersonalAnalysisProfile",
     "PersonalAnalysisJob",
     "PersonalAnalysisHistory",
+    "TelegramNotificationSettings",
+    "TelegramNotificationDelivery",
 ]

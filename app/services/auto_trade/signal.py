@@ -191,6 +191,15 @@ def parse_auto_trade_signal(payload: dict[str, Any]) -> ParsedAutoTradeSignal:
         confidence_pct = float(confidence_raw)
     except (TypeError, ValueError) as exc:
         raise ValueError("confidence_pct must be a number in [0, 100].") from exc
+    # Symmetric with ``adapt_legacy_analysis_structured_payload``: accept
+    # both fraction (0..1) and percent (0..100). Some signal producers — in
+    # particular the AI core — emit confidence as a fraction even when the
+    # strict-contract field is named ``confidence_pct``. Without this
+    # normalization the two parse paths diverge and a strict-contract
+    # signal with ``confidence_pct: 0.65`` would land in the gate as the
+    # literal 0.65, silently below any realistic user threshold.
+    if 0 < confidence_pct <= 1.0:
+        confidence_pct *= 100.0
     if confidence_pct < 0 or confidence_pct > 100:
         raise ValueError("confidence_pct must be in range [0, 100].")
 

@@ -9,11 +9,12 @@ from app.schemas.exchange_trading import (
     AccountTradesRead,
     AccountTradesSyncStateRead,
 )
-from app.services.auto_trade.signal import to_linear_perp_symbol
+from app.services.auto_trade.income_sync import sum_funding
 from app.services.auto_trade.service import AutoTradeService
+from app.services.auto_trade.signal import to_linear_perp_symbol
 from app.services.auto_trade.trade_sync import ExchangeTradeSyncService
 from app.services.exchange_credentials.service import ExchangeCredentialsService
-from app.services.execution.futures_pnl import calculate_futures_pnl_fifo
+from app.services.execution.futures_pnl import compute_realized_breakdown
 from app.services.execution.trading_service import TradingService
 
 
@@ -76,8 +77,19 @@ class AccountTradesService:
         except Exception as exc:
             warnings.append(f"futures_position_unavailable: {exc}")
 
-        pnl = calculate_futures_pnl_fifo(
-            symbol=normalized_symbol, trades=rows, live_position=live_position
+        # Funding for this symbol (best-effort; 0 if income ledger unavailable).
+        funding = 0.0
+        try:
+            funding = await sum_funding(
+                session=session, account_id=account_id, symbol=normalized_symbol
+            )
+        except Exception:
+            funding = 0.0
+        pnl = compute_realized_breakdown(
+            symbol=normalized_symbol,
+            trades=rows,
+            funding=funding,
+            live_position=live_position,
         )
         events = await self._auto_trade.list_events(
             session=session,
@@ -105,10 +117,14 @@ class AccountTradesService:
                 for row in rows
             ],
             pnl=AccountTradesPnlRead(
-                realized=float(pnl.realized),
-                unrealized=float(pnl.unrealized),
+                realized=float(pnl.gross_realized),
+                unrealized=float(pnl.unrealized or 0.0),
                 base_currency=pnl.base_currency,
                 quote_currency=pnl.quote_currency,
+                gross_realized_usdt=float(pnl.gross_realized),
+                commission_usdt=float(pnl.commission),
+                funding_usdt=float(pnl.funding),
+                net_pnl_usdt=float(pnl.net_realized),
             ),
             sync_state=AccountTradesSyncStateRead(
                 last_trade_id=(state.last_trade_id if state is not None else None),

@@ -52,6 +52,21 @@ class NormalizedTrade(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+class NormalizedIncome(BaseModel):
+    """One exchange income row (Binance ``/fapi/v1/income``). ``income`` is
+    signed: positive is an inflow (funding received), negative an outflow."""
+
+    income_type: str
+    asset: str
+    income: float
+    symbol: str | None = None
+    tran_id: str
+    trade_id: str | None = None
+    info: str | None = None
+    timestamp: datetime | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
 class NormalizedFuturesPosition(BaseModel):
     symbol: str
     side: FuturesPositionSide
@@ -181,6 +196,12 @@ class AccountTradesPnlRead(BaseModel):
     unrealized: float
     base_currency: str
     quote_currency: str
+    # Explicit decomposition: ``realized`` stays the gross exchange realized PnL;
+    # net_pnl = gross_realized − commission + funding.
+    gross_realized_usdt: float | None = None
+    commission_usdt: float | None = None
+    funding_usdt: float | None = None
+    net_pnl_usdt: float | None = None
 
 
 class AccountTradesSyncStateRead(BaseModel):

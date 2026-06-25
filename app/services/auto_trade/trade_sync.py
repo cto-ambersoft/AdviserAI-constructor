@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,6 +38,37 @@ def _to_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def extract_realized_pnl(raw: object) -> float | None:
+    """Lift Binance's authoritative per-fill ``realizedPnl`` from a stored ccxt
+    trade payload.
+
+    Returns the gross price PnL of the fill (``0.0`` on opening fills, non-zero
+    on closing fills — it excludes commission and funding, which are tracked
+    separately), or ``None`` when the field is absent or non-numeric. For
+    Binance USDⓈ-M the value lives under ``raw['info']['realizedPnl']``; a
+    top-level key is accepted as a fallback. ``None`` (missing) is deliberately
+    distinct from ``0.0`` (an authoritative zero) so the PnL engine can tell an
+    un-tagged legacy fill from a real break-even fill.
+    """
+    if not isinstance(raw, dict):
+        return None
+    sources: list[dict[str, Any]] = [raw]
+    info = raw.get("info")
+    if isinstance(info, dict):
+        sources.insert(0, info)
+    for source in sources:
+        value = source.get("realizedPnl")
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            return parsed
+    return None
 
 
 @dataclass(slots=True)
@@ -197,6 +229,7 @@ class ExchangeTradeSyncService:
                         "auto_trade_position_id": origin.position_id,
                         "open_history_id": origin.open_history_id,
                         "close_history_id": origin.close_history_id,
+                        "realized_pnl": extract_realized_pnl(trade.raw),
                         "raw_trade": trade.raw if isinstance(trade.raw, dict) else {},
                     }
                 )
@@ -297,6 +330,7 @@ class ExchangeTradeSyncService:
                             "auto_trade_position_id": origin.position_id,
                             "open_history_id": origin.open_history_id,
                             "close_history_id": origin.close_history_id,
+                            "realized_pnl": extract_realized_pnl(trade.raw),
                             "raw_trade": trade.raw if isinstance(trade.raw, dict) else {},
                         }
                     )
@@ -345,6 +379,7 @@ class ExchangeTradeSyncService:
         symbol: str | None = None,
         origin: str | None = None,
         limit: int = 100,
+        config_id: int | None = None,
     ) -> list[ExchangeTradeLedger]:
         stmt: Select[tuple[ExchangeTradeLedger]] = (
             select(ExchangeTradeLedger)
@@ -360,6 +395,11 @@ class ExchangeTradeSyncService:
             stmt = stmt.where(ExchangeTradeLedger.symbol == symbol)
         if origin is not None:
             stmt = stmt.where(ExchangeTradeLedger.origin == origin)
+        if config_id is not None:
+            # W7 asset-expansion: when the UI scopes to a specific strategy
+            # (config), narrow the trade ledger view to only that config's
+            # fills so BTC + ETH on the same credential do not bleed.
+            stmt = stmt.where(ExchangeTradeLedger.auto_trade_config_id == config_id)
         return list((await session.scalars(stmt)).all())
 
     async def get_sync_state(
@@ -448,6 +488,7 @@ class ExchangeTradeSyncService:
             "cost",
             "fee_cost",
             "fee_currency",
+            "realized_pnl",
             "origin",
             "origin_confidence",
             "auto_trade_config_id",

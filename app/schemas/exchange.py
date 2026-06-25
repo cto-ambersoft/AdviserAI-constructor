@@ -6,18 +6,6 @@ from app.models.exchange import EXCHANGE_MODE_REAL
 from app.schemas.exchange_trading import SUPPORTED_EXCHANGE_MODES, SUPPORTED_EXCHANGES
 
 
-class ExchangeSecretIn(BaseModel):
-    api_key: str = Field(min_length=1)
-    api_secret: str = Field(min_length=1)
-    passphrase: str | None = None
-
-
-class ExchangeSecretOut(BaseModel):
-    encrypted_api_key: str
-    encrypted_api_secret: str
-    encrypted_passphrase: str | None = None
-
-
 class ExchangeAccountCreate(BaseModel):
     exchange_name: str = Field(min_length=2, max_length=32)
     account_label: str = Field(min_length=1, max_length=64)

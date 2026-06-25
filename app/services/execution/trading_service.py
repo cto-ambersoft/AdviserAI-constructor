@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.exchange_trading import (
     NormalizedFuturesPosition,
+    NormalizedIncome,
     NormalizedTrade,
     OrderSide,
     SpotBalancesRead,
@@ -395,3 +396,40 @@ class TradingService:
             limit=limit,
             cursor=cursor,
         )
+
+    async def fetch_futures_income(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        since: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[NormalizedIncome]:
+        await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        return await adapter.fetch_futures_income(symbol=symbol, since=since, limit=limit)
+
+    async def fetch_mark_prices(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        assets: list[str],
+        quote: str = "USDT",
+    ) -> dict[str, float]:
+        await self._credentials_service.get_account(session, account_id, user_id)
+        credentials = await self._credentials_service.get_decrypted_credentials(
+            session=session,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        adapter = create_cex_adapter(credentials)
+        return await adapter.fetch_mark_prices(assets=assets, quote=quote)

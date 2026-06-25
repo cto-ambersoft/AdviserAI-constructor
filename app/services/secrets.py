@@ -4,7 +4,10 @@ from app.core.security import SecretCipher
 
 class SecretsService:
     def __init__(self) -> None:
-        self._cipher = SecretCipher(get_settings().encryption_key)
+        settings = get_settings()
+        self._cipher = SecretCipher(
+            settings.encryption_key, legacy_keys=settings.encryption_legacy_keys
+        )
 
     def encrypt_credentials(
         self,

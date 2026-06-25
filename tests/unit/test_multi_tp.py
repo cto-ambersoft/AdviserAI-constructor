@@ -272,10 +272,11 @@ async def test_sl_lock_pct_fifty_long_resolves_halfway() -> None:
 
 
 async def test_sl_lock_pct_hundred_long_resolves_to_tp_price() -> None:
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.LONG,
         entry=100_000.0,
-        tp_offsets_and_locks=[(2.0, 100.0)],
+        tp_offsets_and_locks=[(2.0, 100.0), (4.0, None)],
     )
     adapter = AsyncMock(spec=ExchangeAdapter)
     order_queue = AsyncMock(spec=OrderExecutionQueue)
@@ -289,10 +290,11 @@ async def test_sl_lock_pct_hundred_long_resolves_to_tp_price() -> None:
 
 
 async def test_sl_lock_pct_short_zero_resolves_to_entry() -> None:
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.SHORT,
         entry=100_000.0,
-        tp_offsets_and_locks=[(1.0, 0.0)],
+        tp_offsets_and_locks=[(1.0, 0.0), (3.0, None)],
     )
     adapter = AsyncMock(spec=ExchangeAdapter)
     order_queue = AsyncMock(spec=OrderExecutionQueue)
@@ -306,10 +308,11 @@ async def test_sl_lock_pct_short_zero_resolves_to_entry() -> None:
 
 
 async def test_sl_lock_pct_short_fifty_resolves_halfway() -> None:
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.SHORT,
         entry=100_000.0,
-        tp_offsets_and_locks=[(1.0, 50.0)],
+        tp_offsets_and_locks=[(1.0, 50.0), (3.0, None)],
     )
     adapter = AsyncMock(spec=ExchangeAdapter)
     order_queue = AsyncMock(spec=OrderExecutionQueue)
@@ -324,10 +327,11 @@ async def test_sl_lock_pct_short_fifty_resolves_halfway() -> None:
 
 async def test_sl_lock_pct_takes_priority_over_move_sl_to() -> None:
     """When both sl_lock_pct and move_sl_to are set, lock_pct wins."""
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.LONG,
         entry=100_000.0,
-        tp_offsets_and_locks=[(1.0, 50.0)],
+        tp_offsets_and_locks=[(1.0, 50.0), (3.0, None)],
     )
     # Inject conflicting legacy string — should be ignored.
     position.tp_levels[0].move_sl_to = "breakeven"
@@ -344,10 +348,11 @@ async def test_sl_lock_pct_takes_priority_over_move_sl_to() -> None:
 
 
 async def test_legacy_move_sl_to_breakeven_still_works_when_lock_pct_unset() -> None:
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.LONG,
         entry=100_000.0,
-        tp_offsets_and_locks=[(1.0, None)],
+        tp_offsets_and_locks=[(1.0, None), (3.0, None)],
     )
     position.tp_levels[0].move_sl_to = "breakeven"
 
@@ -386,10 +391,11 @@ async def test_sl_lock_pct_negative_long_places_sl_below_entry() -> None:
     Use case: after TP1 fires, user wants to reduce risk but not all the way to
     breakeven. e.g. -50 → halfway between entry and what would be a mirror of TP.
     """
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.LONG,
         entry=100_000.0,
-        tp_offsets_and_locks=[(1.0, -50.0)],
+        tp_offsets_and_locks=[(1.0, -50.0), (3.0, None)],
     )
     adapter = AsyncMock(spec=ExchangeAdapter)
     order_queue = AsyncMock(spec=OrderExecutionQueue)
@@ -404,10 +410,11 @@ async def test_sl_lock_pct_negative_long_places_sl_below_entry() -> None:
 
 async def test_sl_lock_pct_negative_short_places_sl_above_entry() -> None:
     """Mirror case for SHORT: negative lock_pct moves SL ABOVE entry."""
+    # Two levels so TP1 is non-final and ``replace_sl`` is enqueued.
     position = _build_position_with_lock(
         side=PositionSide.SHORT,
         entry=100_000.0,
-        tp_offsets_and_locks=[(1.0, -50.0)],
+        tp_offsets_and_locks=[(1.0, -50.0), (3.0, None)],
     )
     adapter = AsyncMock(spec=ExchangeAdapter)
     order_queue = AsyncMock(spec=OrderExecutionQueue)
@@ -439,3 +446,269 @@ async def test_sl_lock_pct_resolver_handles_full_negative_range() -> None:
         assert result == pytest.approx(expected_sl), (
             f"lock_pct={lock_pct} gave {result}, expected {expected_sl}"
         )
+
+
+# ─── D1 / D3 / D4 regressions: TP3 + SL must not "fly off" ─────────────────
+
+
+async def test_final_tp_does_not_enqueue_replace_sl_with_zero_qty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: TP3 firing the final slice must NOT enqueue replace_sl(qty=0).
+
+    Before the fix, ``handle_tp_triggered`` zeroed ``current_quantity`` and
+    then enqueued a ``replace_sl`` task whose ``cancel_and_replace_sl`` call
+    would hit Binance with ``quantity=0``, fail the LOT_SIZE filter four
+    times, escalate to a fatal-error path, and leave the position
+    unprotected. Now the engine must skip the SL move entirely on the last
+    declared level and emit ``sl_adjustment_skipped`` with reason
+    ``last_level``.
+    """
+    position = _build_position_with_lock(
+        side=PositionSide.LONG,
+        entry=100_000.0,
+        tp_offsets_and_locks=[(1.0, 0.0), (2.0, 50.0), (3.0, 100.0)],
+    )
+    # Simulate TP1+TP2 already triggered.
+    position.tp_levels[0].status = "triggered"
+    position.tp_levels[1].status = "triggered"
+    position.current_quantity = position.original_quantity * (
+        position.tp_levels[2].close_pct / 100.0
+    )
+
+    audit_events: list[tuple[str, dict]] = []
+
+    async def _capture(event: str, payload: dict) -> None:
+        audit_events.append((event, payload))
+
+    monkeypatch.setattr(
+        "app.services.sl_tp.multi_tp.auto_trade_audit.emit", _capture
+    )
+
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    order_queue = AsyncMock(spec=OrderExecutionQueue)
+    engine = MultiTPEngine(position, adapter, order_queue)
+
+    await engine.handle_tp_triggered(triggered_level=2)
+
+    actions = [call.args[0].action for call in order_queue.enqueue.await_args_list]
+    assert "replace_sl" not in actions
+    assert position.current_quantity == pytest.approx(0.0)
+    assert position.state_machine.state == PositionState.CLOSED
+
+    skip_events = [payload for event, payload in audit_events if event == "sl_adjustment_skipped"]
+    assert any(payload.get("reason") == "last_level" for payload in skip_events), (
+        f"Expected an sl_adjustment_skipped/last_level event, got {audit_events!r}"
+    )
+
+
+async def test_intermediate_tp_completing_position_skips_replace_sl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a non-final TP whose cumulative close drains the position
+    must also skip the SL move (reason: ``position_closing``).
+
+    Models a config like ``close_pct=[50, 50, …]`` where TP2 already takes
+    ``current_quantity`` to 0 even though TP3 is still open on the exchange.
+    The previous code would enqueue ``replace_sl(qty=0)`` here too.
+    """
+    audit_events: list[tuple[str, dict]] = []
+
+    async def _capture(event: str, payload: dict) -> None:
+        audit_events.append((event, payload))
+
+    monkeypatch.setattr(
+        "app.services.sl_tp.multi_tp.auto_trade_audit.emit", _capture
+    )
+
+    position = _build_position_with_lock(
+        side=PositionSide.LONG,
+        entry=100_000.0,
+        tp_offsets_and_locks=[(1.0, 0.0), (2.0, 50.0), (3.0, 100.0)],
+    )
+    # Force the dangerous configuration: TP1+TP2 sum to 100% but TP3 still open.
+    position.tp_levels[0].close_pct = 50.0
+    position.tp_levels[1].close_pct = 50.0
+    position.tp_levels[2].close_pct = 0.0
+    # TP1 already triggered, half closed.
+    position.tp_levels[0].status = "triggered"
+    position.current_quantity = 0.5
+
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    order_queue = AsyncMock(spec=OrderExecutionQueue)
+    engine = MultiTPEngine(position, adapter, order_queue)
+
+    await engine.handle_tp_triggered(triggered_level=1)
+
+    actions = [call.args[0].action for call in order_queue.enqueue.await_args_list]
+    assert "replace_sl" not in actions
+    assert position.current_quantity == pytest.approx(0.0)
+    assert position.state_machine.state == PositionState.CLOSED
+
+    skip_events = [payload for event, payload in audit_events if event == "sl_adjustment_skipped"]
+    assert any(payload.get("reason") == "position_closing" for payload in skip_events), (
+        f"Expected an sl_adjustment_skipped/position_closing event, got {audit_events!r}"
+    )
+
+
+async def test_replace_sl_uses_close_position_true() -> None:
+    """Replacement SL must be position-attached (``closePosition=true``).
+
+    Binance ignores the quantity field in this mode and auto-tracks the live
+    position size, eliminating the qty-0 / dust class of failures and
+    keeping behaviour consistent with the initial bracket SL.
+    """
+    position = _build_position_with_lock(
+        side=PositionSide.LONG,
+        entry=100_000.0,
+        tp_offsets_and_locks=[(1.0, 0.0), (2.0, 50.0), (3.0, 100.0)],
+    )
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    order_queue = AsyncMock(spec=OrderExecutionQueue)
+    engine = MultiTPEngine(position, adapter, order_queue)
+
+    await engine.handle_tp_triggered(triggered_level=0)
+
+    replace_calls = [
+        call.args[0]
+        for call in order_queue.enqueue.await_args_list
+        if call.args and call.args[0].action == "replace_sl"
+    ]
+    assert len(replace_calls) == 1, "expected exactly one replace_sl on TP1"
+    task = replace_calls[0]
+    assert task.params["close_position"] is True
+
+
+async def test_handle_tp_triggered_is_idempotent_for_already_triggered_level(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a duplicate WS delivery that somehow reaches the engine
+    for a level whose ``status`` is already ``triggered`` must be a no-op.
+
+    Before the idempotency guard, a duplicate dispatch (Binance occasionally
+    re-emits ORDER_TRADE_UPDATE around reconnects, and the partial-close
+    reconciler can race the order topic) would re-subtract ``close_qty``
+    from ``current_quantity``, re-append a TP-history row, and re-enqueue
+    a ``replace_sl`` task — cascading the position toward
+    ``current_quantity <= 0`` and tripping the
+    ``_cancel_remaining_orders`` cleanup on a position still open on the
+    exchange. The user-observed symptom was "TP1 fires and the rest of
+    the position is flattened at market a few seconds later".
+    """
+    audit_events: list[tuple[str, dict]] = []
+
+    async def _capture(event: str, payload: dict) -> None:
+        audit_events.append((event, payload))
+
+    monkeypatch.setattr(
+        "app.services.sl_tp.multi_tp.auto_trade_audit.emit", _capture
+    )
+
+    position = _build_position_with_lock(
+        side=PositionSide.LONG,
+        entry=100_000.0,
+        tp_offsets_and_locks=[(1.0, 0.0), (2.0, 50.0), (3.0, 100.0)],
+    )
+    # Pretend TP1 already processed.
+    position.tp_levels[0].status = "triggered"
+    snapshot_qty = position.current_quantity = 0.667
+    snapshot_history_len = len(position.tp_history)
+
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    order_queue = AsyncMock(spec=OrderExecutionQueue)
+    engine = MultiTPEngine(position, adapter, order_queue)
+
+    await engine.handle_tp_triggered(triggered_level=0)
+
+    # No state mutation: quantity, history, status — all untouched.
+    assert position.current_quantity == pytest.approx(snapshot_qty)
+    assert len(position.tp_history) == snapshot_history_len
+    assert position.tp_levels[0].status == "triggered"
+    # No order task enqueued.
+    assert order_queue.enqueue.await_count == 0
+    # Loud audit event emitted so operators can spot duplicate dispatches.
+    duplicate_events = [
+        payload
+        for event, payload in audit_events
+        if event == "multi_tp_duplicate_dispatch_ignored"
+    ]
+    assert duplicate_events and duplicate_events[0]["triggered_level"] == 0
+
+
+async def test_handle_tp_triggered_refuses_sl_target_above_tp_for_long(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Misconfigured ``sl_lock_pct > 100`` (out of intended range) must
+    not produce a STOP_MARKET SELL above the TP price — that would fire
+    immediately on Binance and close the rest of the position at market.
+
+    The schema validates ``sl_lock_pct`` to [-100, 200], so a value of
+    200 is admissible at save time even though it produces a target SL
+    above the TP trigger. This runtime guard catches such cases.
+    """
+    audit_events: list[tuple[str, dict]] = []
+
+    async def _capture(event: str, payload: dict) -> None:
+        audit_events.append((event, payload))
+
+    monkeypatch.setattr(
+        "app.services.sl_tp.multi_tp.auto_trade_audit.emit", _capture
+    )
+
+    # TP1 at +1% with sl_lock_pct=200 → target = entry + 1% × 2 = entry + 2%.
+    # That's above TP1's trigger (entry + 1%) → would immediately fire.
+    position = _build_position_with_lock(
+        side=PositionSide.LONG,
+        entry=100_000.0,
+        tp_offsets_and_locks=[(1.0, 200.0), (3.0, None)],
+    )
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    order_queue = AsyncMock(spec=OrderExecutionQueue)
+    engine = MultiTPEngine(position, adapter, order_queue)
+
+    await engine.handle_tp_triggered(triggered_level=0)
+
+    # No ``replace_sl`` enqueued.
+    actions = [call.args[0].action for call in order_queue.enqueue.await_args_list]
+    assert "replace_sl" not in actions
+
+    # Skip event emitted with the diagnostic reason.
+    skipped = [
+        payload
+        for event, payload in audit_events
+        if event == "sl_adjustment_skipped"
+    ]
+    assert any(p.get("reason") == "would_trigger_immediately" for p in skipped)
+
+
+async def test_last_level_dust_force_full_close_qty() -> None:
+    """The final TP must consume whatever ``current_quantity`` remains.
+
+    With ``close_pct=[33, 33, 34]`` and ``original_quantity=0.001`` the
+    naive arithmetic ``original_qty * close_pct / 100`` leaves a 1e-18
+    floating-point residue; the engine now forces the last level's
+    close-qty to the live remaining quantity so the position is exactly
+    flat after the final fill.
+    """
+    position = _build_position_with_lock(
+        side=PositionSide.LONG,
+        entry=100_000.0,
+        tp_offsets_and_locks=[(1.0, 0.0), (2.0, 50.0), (3.0, 100.0)],
+    )
+    position.original_quantity = 0.001
+    position.current_quantity = 0.001
+    # Set realistic 33/33/34 split.
+    position.tp_levels[0].close_pct = 33.0
+    position.tp_levels[1].close_pct = 33.0
+    position.tp_levels[2].close_pct = 34.0
+
+    adapter = AsyncMock(spec=ExchangeAdapter)
+    order_queue = AsyncMock(spec=OrderExecutionQueue)
+    engine = MultiTPEngine(position, adapter, order_queue)
+
+    await engine.handle_tp_triggered(triggered_level=0)
+    await engine.handle_tp_triggered(triggered_level=1)
+    await engine.handle_tp_triggered(triggered_level=2)
+
+    assert position.current_quantity == 0.0
+    assert position.state_machine.state == PositionState.CLOSED

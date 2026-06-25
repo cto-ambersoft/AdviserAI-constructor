@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, ForeignKey, String, Text
+from sqlalchemy import JSON, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -6,6 +6,16 @@ from app.models.base import Base, TimestampMixin
 
 class AutoTradeEvent(Base, TimestampMixin):
     __tablename__ = "auto_trade_events"
+    __table_args__ = (
+        # Supports the cooldown dedup count in the anomaly / promotion-gate
+        # sweeps: WHERE config_id=? AND event_type=? AND created_at >= ?.
+        Index(
+            "ix_auto_trade_events_config_type_created",
+            "config_id",
+            "event_type",
+            "created_at",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)

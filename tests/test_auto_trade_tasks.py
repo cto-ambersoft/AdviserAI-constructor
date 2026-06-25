@@ -61,3 +61,21 @@ async def test_sync_auto_trade_exchange_trades_task_uses_service(
     assert result["synced"] == 1
     assert result["inserted_or_updated"] == 2
 
+
+async def test_sync_auto_trade_exchange_income_task_uses_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_sync(*, session: object) -> dict[str, int]:
+        assert session is not None
+        return {"configs": 1, "synced": 1, "inserted_or_updated": 3, "errors": 0}
+
+    monkeypatch.setattr(worker_tasks, "AsyncSessionFactory", _DummySessionFactory())
+    monkeypatch.setattr(
+        worker_tasks.income_sync_service,
+        "sync_running_configs",
+        _fake_sync,
+    )
+    result = await worker_tasks.sync_auto_trade_exchange_income()
+    assert result["synced"] == 1
+    assert result["inserted_or_updated"] == 3
+

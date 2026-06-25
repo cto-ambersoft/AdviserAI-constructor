@@ -42,10 +42,48 @@ def test_calculate_spot_pnl_fifo_with_fees() -> None:
     btc = assets[0]
     assert btc.asset == "BTC"
     assert btc.quantity == 0.6
-    assert btc.average_entry_price == 101.0
+    # average_entry_price is the actual fill price (100), not the fee-inflated
+    # cost basis (101). Realized/unrealized/fees are unchanged: the cost basis
+    # still drives unrealized (Binance break-even semantics).
+    assert btc.average_entry_price == 100.0
     assert round(realized, 2) == 11.1
     assert round(unrealized, 2) == 23.4
     assert round(fees, 2) == 1.5
+
+
+def test_calculate_spot_pnl_average_entry_excludes_fee() -> None:
+    """T12: average_entry_price is the fill price; the entry fee shows up as
+    unrealized loss (mark == fill price ⇒ you are down exactly the fee), not as
+    an inflated entry price (Binance entryPrice vs breakEvenPrice)."""
+    trades = [
+        NormalizedTrade(
+            id="1",
+            symbol="BTC/USDT",
+            side="buy",
+            amount=1.0,
+            price=100.0,
+            fee_cost=1.0,
+            fee_currency="USDT",
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+    ]
+    balances = [
+        NormalizedBalance(asset="BTC", free=1.0, used=0.0, total=1.0),
+        NormalizedBalance(asset="USDT", free=0.0, used=0.0, total=0.0),
+    ]
+    assets, realized, unrealized, fees = calculate_spot_pnl(
+        trades=trades,
+        balances=balances,
+        quote_asset="USDT",
+        mark_prices={"BTC": 100.0},
+    )
+
+    assert len(assets) == 1
+    btc = assets[0]
+    assert btc.average_entry_price == 100.0  # fill price, not 101 (incl. fee)
+    assert round(realized, 2) == 0.0
+    assert round(unrealized, 2) == -1.0  # cost basis 101 vs mark 100 → −1 fee
+    assert round(fees, 2) == 1.0
 
 
 def test_calculate_spot_pnl_converts_base_fee_to_quote() -> None:
