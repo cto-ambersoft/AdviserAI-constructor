@@ -174,13 +174,55 @@
         }
       }
     },
+    "/api/v1/auth/2fa/login/email/request": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Request Login Email Code",
+        "description": "Email an ``email_2fa_login`` code for the user behind a valid login challenge.\n\nThe challenge token is validated first (it proves the password already passed),\nso this can't be used for user enumeration; rate-limited per source IP. To avoid\nenumeration, a user without email-2FA still yields a generic ``sent: True`` (no\ncode is actually sent).",
+        "operationId": "request_login_email_code_api_v1_auth_2fa_login_email_request_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwoFactorLoginEmailRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Email2FACodeSentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/2fa/login": {
       "post": {
         "tags": [
           "auth"
         ],
         "summary": "Login 2Fa",
-        "description": "Second step of login-2FA: exchange the challenge + a TOTP/recovery code for the\ntoken pair. Reuses TotpService.verify, so brute-force lockout (429) and the\nrecovery-code fallback apply here too.",
+        "description": "Second step of login-2FA: exchange the challenge + a second-factor code for the\ntoken pair. ``method=totp`` (default) reuses TotpService.verify (brute-force\nlockout + recovery-code fallback); ``method=email`` consumes an emailed\n``email_2fa_login`` code requested via /2fa/login/email/request.",
         "operationId": "login_2fa_api_v1_auth_2fa_login_post",
         "requestBody": {
           "content": {
@@ -381,19 +423,46 @@
         ]
       }
     },
+    "/api/v1/auth/2fa/step-up/email/request": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Request Step Up Email Code",
+        "description": "Email an ``email_2fa_step_up`` code for a user with email-2FA enrolled. The\ncode is then submitted to /2fa/step-up with ``method=email``. Rate-limited.",
+        "operationId": "request_step_up_email_code_api_v1_auth_2fa_step_up_email_request_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Email2FACodeSentResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/auth/2fa/step-up": {
       "post": {
         "tags": [
           "auth"
         ],
         "summary": "Step Up 2Fa",
-        "description": "Exchange a fresh TOTP code for a short-lived step-up token used to authorize\ncritical actions. Meaningless without an active enrollment, so reject early.",
+        "description": "Exchange a fresh second-factor code for a short-lived step-up token used to\nauthorize critical actions. Accepts either a TOTP/recovery code (``method=totp``,\ndefault) or an emailed code (``method=email``). The minted token is\nfactor-agnostic, so ``require_step_up`` and the gated-endpoint list are unchanged.",
         "operationId": "step_up_2fa_api_v1_auth_2fa_step_up_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TotpVerifyRequest"
+                "$ref": "#/components/schemas/StepUpRequest"
               }
             }
           },
@@ -465,6 +534,160 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TotpStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/2fa/email/enroll": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Enroll Email 2Fa",
+        "description": "Begin email-2FA enrollment: email a code the user must confirm (verify-on-\nenroll — the account email is not implicitly trusted). Requires Resend to be\nconfigured (503 otherwise). Throttled per user to prevent email-bombing.",
+        "operationId": "enroll_email_2fa_api_v1_auth_2fa_email_enroll_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Email2FACodeSentResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/2fa/email/confirm": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Confirm Email 2Fa",
+        "description": "Confirm enrollment with the emailed code → activates email-2FA. Wrong/expired\ncode → 400; per-factor lockout → 429.",
+        "operationId": "confirm_email_2fa_api_v1_auth_2fa_email_confirm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Email2FAConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Email2FAStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/2fa/email/status": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Status Email 2Fa",
+        "operationId": "status_email_2fa_api_v1_auth_2fa_email_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Email2FAStatusResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/2fa/email": {
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Disable Email 2Fa",
+        "operationId": "disable_email_2fa_api_v1_auth_2fa_email_delete",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Step-Up-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Step-Up-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Email2FAStatusResponse"
                 }
               }
             }
@@ -2448,6 +2671,144 @@
             }
           }
         },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoTradeConfigRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/live/auto-trade/risk-config/apply-all": {
+      "patch": {
+        "tags": [
+          "live"
+        ],
+        "summary": "Apply one risk config to all of the user's strategies (step-up required)",
+        "operationId": "apply_risk_config_to_all_strategies_api_v1_live_auto_trade_risk_config_apply_all_patch",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-Step-Up-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Step-Up-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutoTradeRiskConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskConfigBulkApplyResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/live/auto-trade/config/{config_id}/rollback/{revision_id}": {
+      "post": {
+        "tags": [
+          "live"
+        ],
+        "summary": "Roll a strategy config back to a prior revision (step-up required)",
+        "operationId": "rollback_auto_trade_config_api_v1_live_auto_trade_config__config_id__rollback__revision_id__post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "config_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Config Id"
+            }
+          },
+          {
+            "name": "revision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "title": "Revision Id"
+            }
+          },
+          {
+            "name": "X-Step-Up-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Step-Up-Token"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -7335,6 +7696,34 @@
             ],
             "title": "Last Stopped At"
           },
+          "risk_off_latched": {
+            "type": "boolean",
+            "title": "Risk Off Latched",
+            "default": false
+          },
+          "risk_off_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Risk Off Reason"
+          },
+          "risk_off_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Risk Off At"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time",
@@ -9120,6 +9509,52 @@
           "volume"
         ],
         "title": "CandleInput"
+      },
+      "Email2FACodeSentResponse": {
+        "properties": {
+          "sent": {
+            "type": "boolean",
+            "title": "Sent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sent"
+        ],
+        "title": "Email2FACodeSentResponse"
+      },
+      "Email2FAConfirmRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 4,
+            "title": "Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "Email2FAConfirmRequest"
+      },
+      "Email2FAStatusResponse": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          }
+        },
+        "type": "object",
+        "required": [
+          "enabled",
+          "available"
+        ],
+        "title": "Email2FAStatusResponse"
       },
       "EmailConfirmRequest": {
         "properties": {
@@ -11707,6 +12142,20 @@
         ],
         "title": "RefreshTokenRequest"
       },
+      "RiskConfigBulkApplyResponse": {
+        "properties": {
+          "updated_count": {
+            "type": "integer",
+            "title": "Updated Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "updated_count"
+        ],
+        "title": "RiskConfigBulkApplyResponse",
+        "description": "Result of applying one risk config to all of a user's strategies (A2)."
+      },
       "SignInRequest": {
         "properties": {
           "email": {
@@ -11787,6 +12236,30 @@
         },
         "type": "object",
         "title": "SignalExecuteRequest"
+      },
+      "StepUpRequest": {
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": [
+              "totp",
+              "email"
+            ],
+            "title": "Method",
+            "default": "totp"
+          },
+          "code": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 4,
+            "title": "Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "StepUpRequest"
       },
       "StepUpResponse": {
         "properties": {
@@ -12825,16 +13298,38 @@
         ],
         "title": "TotpVerifyRequest"
       },
+      "TwoFactorLoginEmailRequest": {
+        "properties": {
+          "challenge_token": {
+            "type": "string",
+            "title": "Challenge Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "challenge_token"
+        ],
+        "title": "TwoFactorLoginEmailRequest"
+      },
       "TwoFactorLoginRequest": {
         "properties": {
           "challenge_token": {
             "type": "string",
             "title": "Challenge Token"
           },
+          "method": {
+            "type": "string",
+            "enum": [
+              "totp",
+              "email"
+            ],
+            "title": "Method",
+            "default": "totp"
+          },
           "code": {
             "type": "string",
             "maxLength": 64,
-            "minLength": 6,
+            "minLength": 4,
             "title": "Code"
           }
         },
@@ -12860,6 +13355,13 @@
           "expires_in": {
             "type": "integer",
             "title": "Expires In"
+          },
+          "factors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Factors"
           }
         },
         "type": "object",

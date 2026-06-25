@@ -186,8 +186,18 @@ class AutoTradeConfigRead(BaseModel):
     ] = "live"
     last_started_at: datetime | None
     last_stopped_at: datetime | None
+    # A3: persisted Volatility Kill-Switch risk-off latch (survives restarts).
+    risk_off_latched: bool = False
+    risk_off_reason: str | None = None
+    risk_off_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RiskConfigBulkApplyResponse(BaseModel):
+    """Result of applying one risk config to all of a user's strategies (A2)."""
+
+    updated_count: int
 
 
 class PromotionGateCriterionRead(BaseModel):

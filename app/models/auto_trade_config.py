@@ -96,6 +96,13 @@ class AutoTradeConfig(Base, TimestampMixin):
     sandbox_entered_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # A3 (audit §2.5.9): persisted Volatility Kill-Switch risk-off latch. The
+    # kill-switch already pauses the strategy (is_running=False); these columns
+    # record *why* and *when* so the latch survives a process restart and an
+    # operator can see it. Cleared on a manual resume (set_running True).
+    risk_off_latched: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
+    risk_off_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    risk_off_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def strategy_profile(self) -> dict[str, object] | None:

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import app.services.auto_trade.service as auto_trade_service_module
 from app.models.auto_trade_config import AutoTradeConfig
+from app.models.auto_trade_config_revision import AutoTradeConfigRevision
 from app.models.auto_trade_event import AutoTradeEvent
 from app.models.auto_trade_position import AutoTradePosition
 from app.models.auto_trade_risk_config import AutoTradeRiskConfig as AutoTradeRiskConfigModel
@@ -5999,3 +6000,574 @@ async def test_ai_overlay_block_entry_works_without_optional_traceability(
         assert "reasoning_path" not in payload
         # But the block still happened
         assert payload["reason"] == "ai_trend_up_blocks_short"
+
+
+# ---------------------------------------------------------------------------
+# Phase A — Supervisor completeness (audit follow-up §2)
+# ---------------------------------------------------------------------------
+
+
+async def test_leverage_ceiling_above_exchange_max_rejected(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """A1: Bybit max leverage is 100. A ceiling of 110 passes the schema bound
+    (<=125) but is unattainable on the venue, so the upsert must reject it."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)  # bybit
+        with pytest.raises(ValueError, match="leverage"):
+            await service.upsert_config(
+                session=session,
+                user_id=user.id,
+                payload=AutoTradeConfigUpsertRequest(
+                    enabled=True,
+                    profile_id=profile.id,
+                    account_id=account_id,
+                    position_size_usdt=100.0,
+                    leverage=3,
+                    min_confidence_pct=62.0,
+                    fast_close_confidence_pct=80.0,
+                    confirm_reports_required=2,
+                    risk_mode="1:2",
+                    sl_pct=1.0,
+                    tp_pct=2.0,
+                    risk=AutoTradeRiskConfig(leverage_ceiling=110),
+                ),
+            )
+        # And no half-created config should remain.
+        remaining = (await session.scalars(select(AutoTradeConfig))).all()
+        assert remaining == []
+
+
+async def test_leverage_ceiling_within_exchange_max_accepted(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """A1: a ceiling at the venue max (Bybit 100) is accepted and persisted."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)  # bybit
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=AutoTradeConfigUpsertRequest(
+                enabled=True,
+                profile_id=profile.id,
+                account_id=account_id,
+                position_size_usdt=100.0,
+                leverage=3,
+                min_confidence_pct=62.0,
+                fast_close_confidence_pct=80.0,
+                confirm_reports_required=2,
+                risk_mode="1:2",
+                sl_pct=1.0,
+                tp_pct=2.0,
+                risk=AutoTradeRiskConfig(leverage_ceiling=100),
+            ),
+        )
+        risk = await service.get_risk_config(session=session, config_id=config.id)
+        assert risk is not None
+        assert risk.leverage_ceiling == 100
+
+
+async def _upsert_basic_config(
+    service: "AutoTradeService",
+    session: AsyncSession,
+    *,
+    user_id: int,
+    profile_id: int,
+    account_id: int,
+) -> AutoTradeConfig:
+    return await service.upsert_config(
+        session=session,
+        user_id=user_id,
+        payload=AutoTradeConfigUpsertRequest(
+            enabled=True,
+            profile_id=profile_id,
+            account_id=account_id,
+            position_size_usdt=100.0,
+            leverage=3,
+            min_confidence_pct=62.0,
+            fast_close_confidence_pct=80.0,
+            confirm_reports_required=2,
+            risk_mode="1:2",
+            sl_pct=1.0,
+            tp_pct=2.0,
+        ),
+    )
+
+
+async def test_bulk_apply_risk_config_updates_all_user_strategies(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """A2: one call writes identical risk limits to every config of the user."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        profile2, account_id2 = await _create_profile_and_account(
+            session, user_id=user.id, symbol="ETHUSDT", account_label="second"
+        )
+        cfg1 = await _upsert_basic_config(
+            service, session, user_id=user.id, profile_id=profile.id, account_id=account_id
+        )
+        cfg2 = await _upsert_basic_config(
+            service, session, user_id=user.id, profile_id=profile2.id, account_id=account_id2
+        )
+
+        count = await service.apply_risk_config_to_all_strategies(
+            session=session,
+            user_id=user.id,
+            risk=AutoTradeRiskConfig(daily_loss_limit_usdt=50.0, max_open_positions=2),
+        )
+
+        assert count == 2
+        r1 = await service.get_risk_config(session=session, config_id=cfg1.id)
+        r2 = await service.get_risk_config(session=session, config_id=cfg2.id)
+        assert r1 is not None and r1.daily_loss_limit_usdt == 50.0 and r1.max_open_positions == 2
+        assert r2 is not None and r2.daily_loss_limit_usdt == 50.0 and r2.max_open_positions == 2
+
+
+async def test_bulk_apply_risk_config_leaves_other_users_untouched(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """A2: apply-all is scoped to the caller — another user's config is untouched."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user_a, profile_a, account_a = await _seed_user_profile_and_account(session)
+        cfg_a = await _upsert_basic_config(
+            service, session, user_id=user_a.id, profile_id=profile_a.id, account_id=account_a
+        )
+        user_b = User(email="b@example.com", hashed_password="x", is_active=True)
+        session.add(user_b)
+        await session.flush()
+        profile_b, account_b = await _create_profile_and_account(
+            session, user_id=user_b.id, symbol="BTCUSDT", account_label="b-main"
+        )
+        cfg_b = await _upsert_basic_config(
+            service, session, user_id=user_b.id, profile_id=profile_b.id, account_id=account_b
+        )
+
+        count = await service.apply_risk_config_to_all_strategies(
+            session=session,
+            user_id=user_a.id,
+            risk=AutoTradeRiskConfig(daily_loss_limit_usdt=10.0),
+        )
+
+        assert count == 1
+        assert (await service.get_risk_config(session=session, config_id=cfg_a.id)) is not None
+        # B's config got no risk row.
+        assert (await service.get_risk_config(session=session, config_id=cfg_b.id)) is None
+
+
+async def test_bulk_apply_rejects_leverage_above_venue_and_applies_nothing(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """A2: a leverage ceiling above a config's venue max aborts the whole batch
+    (atomic) — no config ends up with a partial risk row."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)  # bybit max 100
+        cfg1 = await _upsert_basic_config(
+            service, session, user_id=user.id, profile_id=profile.id, account_id=account_id
+        )
+        cfg1_id = cfg1.id  # capture before the aborted transaction expires the ORM object
+        with pytest.raises(ValueError, match="leverage"):
+            await service.apply_risk_config_to_all_strategies(
+                session=session,
+                user_id=user.id,
+                risk=AutoTradeRiskConfig(leverage_ceiling=110),
+            )
+        await session.rollback()
+        assert (await service.get_risk_config(session=session, config_id=cfg1_id)) is None
+
+
+async def _trip_kill_switch(
+    service: "AutoTradeService",
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    user_id: int,
+    profile_id: int,
+    account_id: int,
+    reason: str = "atr_spike",
+) -> AutoTradeConfig:
+    """Helper: seed a running config + open position and trip the kill-switch."""
+    config = await _insert_config(
+        session, user_id=user_id, profile_id=profile_id, account_id=account_id
+    )
+    config.is_running = True
+    position = _make_open_position(
+        user_id=user_id,
+        config_id=config.id,
+        profile_id=profile_id,
+        account_id=account_id,
+        symbol="BTC/USDT:USDT",
+        idx=0,
+    )
+    session.add(position)
+    await session.commit()
+
+    async def fake_flatten(*, session: Any, config: Any, position_row: Any, reason: str) -> None:
+        position_row.status = "closed"
+        position_row.state = "closed"
+
+    monkeypatch.setattr(service, "_flatten_single_position", fake_flatten)
+    signal = KillSwitchSignal(should_close=True, reason=reason, actual=300.0, threshold=200.0)
+    await service.kill_switch_close_position(
+        session=session, position_id=position.id, signal=signal, commit=True
+    )
+    return config
+
+
+async def test_kill_switch_risk_off_latch_persists_across_restart(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A3: the risk-off latch set by a kill-switch trip is persisted, so it
+    survives a process restart (read back from a fresh session)."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await _trip_kill_switch(
+            service, session, monkeypatch,
+            user_id=user.id, profile_id=profile.id, account_id=account_id, reason="atr_spike",
+        )
+        config_id = config.id
+
+    # Fresh session — simulates a process restart reading the persisted latch.
+    async with auto_trade_db() as session2:
+        reloaded = await session2.get(AutoTradeConfig, config_id)
+        assert reloaded is not None
+        assert reloaded.risk_off_latched is True
+        assert reloaded.risk_off_reason == "atr_spike"
+        assert reloaded.risk_off_at is not None
+
+
+async def test_resume_clears_risk_off_latch(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A3: a manual resume (set_running True) clears the risk-off latch."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await _trip_kill_switch(
+            service, session, monkeypatch,
+            user_id=user.id, profile_id=profile.id, account_id=account_id,
+        )
+        resumed = await service.set_running(
+            session=session, user_id=user.id, is_running=True, account_id=account_id
+        )
+        assert resumed.is_running is True
+        assert resumed.risk_off_latched is False
+        assert resumed.risk_off_reason is None
+        assert resumed.risk_off_at is None
+
+
+# ---------------------------------------------------------------------------
+# Phase B — Manual spot path through the supervisor (audit follow-up §3)
+# ---------------------------------------------------------------------------
+
+
+async def test_precheck_manual_order_blocks_on_risk_violation(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """B1: a manual OPEN order on an account with a risk config is gated by the
+    pre-trade engine — a leverage-ceiling violation blocks it + audits it."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await _insert_config(
+            session, user_id=user.id, profile_id=profile.id, account_id=account_id, leverage=10
+        )
+        await service._apply_risk_config(
+            session=session, config_id=config.id, risk=AutoTradeRiskConfig(leverage_ceiling=5)
+        )
+        decision = await service.precheck_manual_order(
+            session=session,
+            user_id=user.id,
+            account_id=account_id,
+            symbol="BTCUSDT",
+            side="LONG",
+            price=100.0,
+        )
+        assert decision.allowed is False
+        assert decision.rule == "leverage"
+        events = (
+            await session.scalars(
+                select(AutoTradeEvent).where(AutoTradeEvent.event_type == "risk_blocked")
+            )
+        ).all()
+        assert len(events) == 1
+
+
+async def test_precheck_manual_order_allows_within_limits(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """B1: a manual order within the account's risk limits is allowed."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await _insert_config(
+            session, user_id=user.id, profile_id=profile.id, account_id=account_id, leverage=2
+        )
+        await service._apply_risk_config(
+            session=session, config_id=config.id, risk=AutoTradeRiskConfig(leverage_ceiling=5)
+        )
+        decision = await service.precheck_manual_order(
+            session=session,
+            user_id=user.id,
+            account_id=account_id,
+            symbol="BTCUSDT",
+            side="LONG",
+            price=100.0,
+        )
+        assert decision.allowed is True
+
+
+async def test_precheck_manual_order_no_config_is_allowed(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """B1 fail-safe: an account with no auto-trade config keeps today's behaviour
+    (manual order allowed, no risk envelope to apply)."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, _profile, account_id = await _seed_user_profile_and_account(session)
+        decision = await service.precheck_manual_order(
+            session=session,
+            user_id=user.id,
+            account_id=account_id,
+            symbol="BTCUSDT",
+            side="LONG",
+            price=100.0,
+        )
+        assert decision.allowed is True
+
+
+async def test_precheck_manual_order_no_risk_config_is_allowed(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """B1 fail-safe: a config without a risk row is a no-op (allow)."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        await _insert_config(
+            session, user_id=user.id, profile_id=profile.id, account_id=account_id, leverage=10
+        )
+        decision = await service.precheck_manual_order(
+            session=session,
+            user_id=user.id,
+            account_id=account_id,
+            symbol="BTCUSDT",
+            side="LONG",
+            price=100.0,
+        )
+        assert decision.allowed is True
+
+
+async def test_precheck_manual_order_sell_is_never_gated(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """B1: a reducing order (spot sell / SHORT) is de-risking and is never blocked,
+    even when an opening order would violate the same risk limit."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await _insert_config(
+            session, user_id=user.id, profile_id=profile.id, account_id=account_id, leverage=10
+        )
+        await service._apply_risk_config(
+            session=session, config_id=config.id, risk=AutoTradeRiskConfig(leverage_ceiling=5)
+        )
+        decision = await service.precheck_manual_order(
+            session=session,
+            user_id=user.id,
+            account_id=account_id,
+            symbol="BTCUSDT",
+            side="SHORT",
+            price=100.0,
+        )
+        assert decision.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# Phase D — Append-only config revisions + content hash + rollback (§7)
+# ---------------------------------------------------------------------------
+
+
+async def _revisions_for(
+    session: AsyncSession, config_id: int
+) -> list[AutoTradeConfigRevision]:
+    return list(
+        (
+            await session.scalars(
+                select(AutoTradeConfigRevision)
+                .where(AutoTradeConfigRevision.config_id == config_id)
+                .order_by(AutoTradeConfigRevision.revision_number)
+            )
+        ).all()
+    )
+
+
+def _revision_upsert_payload(
+    *, profile_id: int, account_id: int, position_size_usdt: float = 100.0
+) -> AutoTradeConfigUpsertRequest:
+    return AutoTradeConfigUpsertRequest(
+        enabled=True,
+        profile_id=profile_id,
+        account_id=account_id,
+        position_size_usdt=position_size_usdt,
+        leverage=3,
+        min_confidence_pct=62.0,
+        fast_close_confidence_pct=80.0,
+        confirm_reports_required=2,
+        risk_mode="1:2",
+        sl_pct=1.0,
+        tp_pct=2.0,
+    )
+
+
+async def test_upsert_config_records_initial_revision(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """D2: creating a config records revision #1 with a content hash + snapshot."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile.id, account_id=account_id),
+        )
+        revisions = await _revisions_for(session, config.id)
+        assert len(revisions) == 1
+        assert revisions[0].revision_number == 1
+        assert len(revisions[0].content_hash) == 64
+        assert revisions[0].snapshot_json["position_size_usdt"] == 100.0
+
+
+async def test_editing_config_records_new_revision(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """D2: a content change appends an immutable revision #2."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile.id, account_id=account_id),
+        )
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(
+                profile_id=profile.id, account_id=account_id, position_size_usdt=250.0
+            ),
+        )
+        revisions = await _revisions_for(session, config.id)
+        assert [r.revision_number for r in revisions] == [1, 2]
+        assert revisions[0].snapshot_json["position_size_usdt"] == 100.0
+        assert revisions[1].snapshot_json["position_size_usdt"] == 250.0
+        assert revisions[0].content_hash != revisions[1].content_hash
+
+
+async def test_identical_resave_does_not_duplicate_revision(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """D2: re-saving identical content does not append a revision (hash dedup)."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile.id, account_id=account_id),
+        )
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile.id, account_id=account_id),
+        )
+        revisions = await _revisions_for(session, config.id)
+        assert len(revisions) == 1
+
+
+async def test_rollback_config_restores_prior_revision(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """D3: rollback restores the prior content AND appends a new revision."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile.id, account_id=account_id),
+        )
+        rev1 = (await _revisions_for(session, config.id))[0]
+        rev1_id = rev1.id
+        await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(
+                profile_id=profile.id, account_id=account_id, position_size_usdt=250.0
+            ),
+        )
+        rolled = await service.rollback_config(
+            session=session, user_id=user.id, config_id=config.id, revision_id=rev1_id
+        )
+        assert rolled.position_size_usdt == 100.0
+        revisions = await _revisions_for(session, config.id)
+        assert [r.revision_number for r in revisions] == [1, 2, 3]
+        assert revisions[2].snapshot_json["position_size_usdt"] == 100.0
+        assert revisions[2].content_hash == revisions[0].content_hash
+
+
+async def test_rollback_config_rejects_other_users_config(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """D3: a user cannot roll back another user's config (ownership)."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user_a, profile_a, account_a = await _seed_user_profile_and_account(session)
+        config = await service.upsert_config(
+            session=session,
+            user_id=user_a.id,
+            payload=_revision_upsert_payload(profile_id=profile_a.id, account_id=account_a),
+        )
+        rev_id = (await _revisions_for(session, config.id))[0].id
+        other = User(email="other@example.com", hashed_password="x", is_active=True)
+        session.add(other)
+        await session.commit()
+        with pytest.raises(LookupError):
+            await service.rollback_config(
+                session=session, user_id=other.id, config_id=config.id, revision_id=rev_id
+            )
+
+
+async def test_rollback_config_rejects_revision_of_other_config(
+    auto_trade_db: async_sessionmaker[AsyncSession],
+) -> None:
+    """D3: a revision_id that does not belong to the target config is rejected."""
+    service = AutoTradeService(trading_service=cast(Any, _FakeTradingService()))
+    async with auto_trade_db() as session:
+        user, profile, account_id = await _seed_user_profile_and_account(session)
+        config = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile.id, account_id=account_id),
+        )
+        config_id = config.id
+        profile2, account_id2 = await _create_profile_and_account(
+            session, user_id=user.id, symbol="ETHUSDT", account_label="second"
+        )
+        config2 = await service.upsert_config(
+            session=session,
+            user_id=user.id,
+            payload=_revision_upsert_payload(profile_id=profile2.id, account_id=account_id2),
+        )
+        foreign_rev_id = (await _revisions_for(session, config2.id))[0].id
+        with pytest.raises(LookupError):
+            await service.rollback_config(
+                session=session, user_id=user.id, config_id=config_id, revision_id=foreign_rev_id
+            )

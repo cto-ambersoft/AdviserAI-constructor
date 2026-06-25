@@ -27,12 +27,14 @@ from app.schemas.auto_trade import (
     AutoTradePositionsResponse,
     AutoTradePositionsSummaryRead,
     AutoTradePositionWithPnlRead,
+    AutoTradeRiskConfig,
     AutoTradeStateResponse,
     BulkLifecycleResponse,
     BulkLifecycleResultItem,
     PortfolioSummaryResponse,
     PositionTraceRead,
     PromotionStatusRead,
+    RiskConfigBulkApplyResponse,
     StrategyHealthRead,
     StrategyPortfolioEntryRead,
 )
@@ -107,6 +109,25 @@ async def _maybe_execute_signal(
     if execution.mode == "live":
         if execution.account_id is None:
             raise HTTPException(status_code=422, detail="account_id is required for live execution")
+        # §3: route the manual order through the account's pre-trade risk envelope
+        # (the same supervisor that gates automated entries). Fail-safe: an account
+        # with no auto-trade config / no risk row, or a reducing order, is allowed
+        # unchanged — this never tightens behaviour for un-configured manual trading.
+        risk_decision = await auto_trade_service.precheck_manual_order(
+            session=session,
+            user_id=current_user.id,
+            account_id=execution.account_id,
+            symbol=signal_symbol,
+            side=side,
+            price=entry,
+        )
+        if not risk_decision.allowed:
+            return {
+                "mode": "live",
+                "status": "blocked",
+                "reason": risk_decision.reason,
+                "rule": risk_decision.rule,
+            }
         payload = SpotOrderCreate(
             account_id=execution.account_id,
             symbol=signal_symbol,
@@ -346,6 +367,52 @@ async def upsert_auto_trade_config(
             session=session,
             user_id=current_user.id,
             payload=payload,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await auto_trade_service.serialize_config(session=session, config=row)
+
+
+@router.patch(
+    "/auto-trade/risk-config/apply-all",
+    response_model=RiskConfigBulkApplyResponse,
+    summary="Apply one risk config to all of the user's strategies (step-up required)",
+)
+async def apply_risk_config_to_all_strategies(
+    payload: AutoTradeRiskConfig,
+    session: DbSession,
+    current_user: RequireStepUp,
+) -> RiskConfigBulkApplyResponse:
+    try:
+        updated = await auto_trade_service.apply_risk_config_to_all_strategies(
+            session=session,
+            user_id=current_user.id,
+            risk=payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RiskConfigBulkApplyResponse(updated_count=updated)
+
+
+@router.post(
+    "/auto-trade/config/{config_id}/rollback/{revision_id}",
+    response_model=AutoTradeConfigRead,
+    summary="Roll a strategy config back to a prior revision (step-up required)",
+)
+async def rollback_auto_trade_config(
+    session: DbSession,
+    current_user: RequireStepUp,
+    config_id: int = Path(ge=1),
+    revision_id: int = Path(ge=1),
+) -> AutoTradeConfigRead:
+    try:
+        row = await auto_trade_service.rollback_config(
+            session=session,
+            user_id=current_user.id,
+            config_id=config_id,
+            revision_id=revision_id,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

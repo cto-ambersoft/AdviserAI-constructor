@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Awaitable, Callable
@@ -16,6 +18,7 @@ from app.db.session import AsyncSessionFactory
 from app.models.auto_trade_config import AutoTradeConfig
 from app.models.auto_trade_event import AutoTradeEvent
 from app.models.auto_trade_position import AutoTradePosition
+from app.models.auto_trade_config_revision import AutoTradeConfigRevision
 from app.models.auto_trade_risk_config import AutoTradeRiskConfig
 from app.models.auto_trade_signal_queue import AutoTradeSignalQueue
 from app.models.auto_trade_signal_state import AutoTradeSignalState
@@ -68,7 +71,12 @@ from app.services.auto_trade.promotion import (
     apply_transition,
     evaluate_promotion_gate,
 )
-from app.services.auto_trade.risk import GuardDecision, check_pre_trade, evaluate_kpi_guard
+from app.services.auto_trade.risk import (
+    GuardDecision,
+    RiskDecision,
+    check_pre_trade,
+    evaluate_kpi_guard,
+)
 from app.services.events.stream import publish_user_event, queue_user_event
 from app.services.exchange.adapter import (
     ConditionalOrderResult,
@@ -189,6 +197,66 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _SUPPORTED_AUTO_TRADE_FUTURES_EXCHANGES = {"bybit", "binance"}
+
+# A1 (audit §2.5.3): venue maximum leverage for USDT-M perpetuals. A
+# ``leverage_ceiling`` above the venue max passes the schema bound (<=125, the
+# Binance max) yet is unattainable on the exchange, so the order would be
+# rejected at placement time. We validate the ceiling against the actual venue
+# at config-write time. Unknown venues fall back to the permissive default so we
+# never *tighten* behaviour for an exchange we don't have a number for.
+_EXCHANGE_MAX_LEVERAGE: dict[str, int] = {"binance": 125, "bybit": 100}
+_DEFAULT_MAX_LEVERAGE = 125
+
+
+def _exchange_max_leverage(exchange_name: str) -> int:
+    return _EXCHANGE_MAX_LEVERAGE.get((exchange_name or "").strip().lower(), _DEFAULT_MAX_LEVERAGE)
+
+
+def _assert_leverage_ceiling_within_exchange(exchange_name: str, leverage_ceiling: int) -> None:
+    """Raise ``ValueError`` if ``leverage_ceiling`` exceeds the venue maximum."""
+    max_leverage = _exchange_max_leverage(exchange_name)
+    if leverage_ceiling > max_leverage:
+        raise ValueError(
+            f"leverage_ceiling {leverage_ceiling} exceeds the "
+            f"{exchange_name or 'exchange'} maximum leverage of {max_leverage}."
+        )
+
+
+def _config_content_snapshot(
+    config: AutoTradeConfig, risk_cfg: AutoTradeRiskConfig | None
+) -> dict[str, Any]:
+    """§7: the editable config-content fields (and the 1:1 risk row) that a
+    revision captures and a rollback restores. Runtime state (``is_running``,
+    ``lifecycle_stage``, ``risk_off_*``, timestamps) is intentionally excluded —
+    it is not user-edited content and must not be rolled back.
+    """
+    return {
+        "enabled": config.enabled,
+        "profile_id": config.profile_id,
+        "account_id": config.account_id,
+        "position_size_usdt": config.position_size_usdt,
+        "leverage": config.leverage,
+        "min_confidence_pct": config.min_confidence_pct,
+        "fast_close_confidence_pct": config.fast_close_confidence_pct,
+        "confirm_reports_required": config.confirm_reports_required,
+        "risk_mode": config.risk_mode,
+        "sl_pct": config.sl_pct,
+        "tp_pct": config.tp_pct,
+        "strategy_profile": config.strategy_profile_json,
+        "strategy_name": config.strategy_name,
+        "attached_forecast_id": config.attached_forecast_id,
+        "risk": (
+            AutoTradeRiskConfigSchema.model_validate(risk_cfg).model_dump(mode="json")
+            if risk_cfg is not None
+            else None
+        ),
+    }
+
+
+def _content_hash(snapshot: dict[str, Any]) -> str:
+    """Stable sha256 of a content snapshot (canonical, key-sorted JSON)."""
+    canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ConfirmationRequiredError(Exception):
@@ -1142,6 +1210,13 @@ class AutoTradeService:
         if account.exchange_name not in _SUPPORTED_AUTO_TRADE_FUTURES_EXCHANGES:
             raise ValueError("Auto-trade futures v1 supports Bybit and Binance USDT-M only.")
 
+        # A1: validate the risk leverage ceiling against the venue max *before*
+        # any mutation, so an invalid ceiling never leaves a half-created config.
+        if payload.risk is not None and payload.risk.leverage_ceiling is not None:
+            _assert_leverage_ceiling_within_exchange(
+                account.exchange_name, payload.risk.leverage_ceiling
+            )
+
         now = _utc_now()
         stmt: Select[tuple[AutoTradeConfig]] = select(AutoTradeConfig).where(
             AutoTradeConfig.user_id == user_id,
@@ -1229,6 +1304,7 @@ class AutoTradeService:
                     commit=True,
                 )
             await self._apply_risk_config(session=session, config_id=row.id, risk=payload.risk)
+            await self._record_config_revision(session=session, config=row, actor="user")
             return row
 
         requested_profile_change = row.profile_id != payload.profile_id
@@ -1342,6 +1418,7 @@ class AutoTradeService:
             commit=True,
         )
         await self._apply_risk_config(session=session, config_id=row.id, risk=payload.risk)
+        await self._record_config_revision(session=session, config=row, actor="user")
         return row
 
     async def get_risk_config(
@@ -1352,6 +1429,199 @@ class AutoTradeService:
     ) -> AutoTradeRiskConfig | None:
         """Fetch the 1:1 Pre-Trade Risk row for a config, or ``None`` if unset."""
         return await session.get(AutoTradeRiskConfig, config_id)
+
+    async def _record_config_revision(
+        self,
+        *,
+        session: AsyncSession,
+        config: AutoTradeConfig,
+        actor: str | None = None,
+    ) -> None:
+        """§7: append an immutable revision of the config's content, if changed.
+
+        Hash-deduped: re-saving identical content (same ``content_hash`` as the
+        latest revision) records nothing, so no-op updates don't inflate history.
+        """
+        risk_cfg = await self.get_risk_config(session=session, config_id=config.id)
+        snapshot = _config_content_snapshot(config, risk_cfg)
+        content_hash = _content_hash(snapshot)
+        latest = await session.scalar(
+            select(AutoTradeConfigRevision)
+            .where(AutoTradeConfigRevision.config_id == config.id)
+            .order_by(AutoTradeConfigRevision.revision_number.desc())
+            .limit(1)
+        )
+        if latest is not None and latest.content_hash == content_hash:
+            return
+        next_number = (latest.revision_number + 1) if latest is not None else 1
+        session.add(
+            AutoTradeConfigRevision(
+                config_id=config.id,
+                revision_number=next_number,
+                content_hash=content_hash,
+                snapshot_json=snapshot,
+                actor=actor,
+            )
+        )
+        await session.commit()
+
+    async def rollback_config(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        config_id: int,
+        revision_id: int,
+    ) -> AutoTradeConfig:
+        """§7: restore a config to a prior revision's content.
+
+        Re-applies the revision's snapshot through :meth:`upsert_config`, so the
+        same validation runs and the rollback itself is recorded as a *new*
+        revision (history stays append-only — nothing is rewritten). Runtime
+        state (lifecycle stage, running flag, risk-off latch) is untouched.
+        Raises ``LookupError`` if the config is not the caller's or the revision
+        does not belong to it.
+        """
+        config = await session.get(AutoTradeConfig, config_id)
+        if config is None or config.user_id != user_id:
+            raise LookupError("Auto-trade config not found.")
+        revision = await session.get(AutoTradeConfigRevision, revision_id)
+        if revision is None or revision.config_id != config_id:
+            raise LookupError("Config revision not found for this strategy.")
+        snap = revision.snapshot_json
+        request = AutoTradeConfigUpsertRequest(
+            enabled=bool(snap["enabled"]),
+            profile_id=int(cast(int, snap["profile_id"])),
+            account_id=int(cast(int, snap["account_id"])),
+            position_size_usdt=float(cast(float, snap["position_size_usdt"])),
+            leverage=int(cast(int, snap["leverage"])),
+            min_confidence_pct=float(cast(float, snap["min_confidence_pct"])),
+            fast_close_confidence_pct=float(cast(float, snap["fast_close_confidence_pct"])),
+            confirm_reports_required=int(cast(int, snap["confirm_reports_required"])),
+            risk_mode=cast(Any, snap["risk_mode"]),
+            sl_pct=float(cast(float, snap["sl_pct"])),
+            tp_pct=float(cast(float, snap["tp_pct"])),
+            strategy_profile=cast(Any, snap["strategy_profile"]),
+            strategy_name=cast(Any, snap["strategy_name"]),
+            attached_forecast_id=cast(Any, snap["attached_forecast_id"]),
+            risk=cast(Any, snap["risk"]),
+        )
+        return await self.upsert_config(session=session, user_id=user_id, payload=request)
+
+    async def evaluate_pre_trade_risk(
+        self,
+        *,
+        session: AsyncSession,
+        config: AutoTradeConfig,
+        signal: ParsedAutoTradeSignal,
+        execution_symbol: str,
+    ) -> RiskDecision:
+        """Run the Pre-Trade Risk Engine for one prospective entry (W8).
+
+        Resolves the config's risk row and computes the daily-loss inputs lazily
+        (no exchange call unless that rule is configured *and* could fire), then
+        delegates to the pure :func:`check_pre_trade`. A missing/disabled risk
+        config returns ``allow`` (fail-safe). Shared by the auto-trade open path
+        and the manual-order precheck so both honour the same envelope.
+        """
+        risk_cfg = await self.get_risk_config(session=session, config_id=config.id)
+        today_realized_pnl_usdt = 0.0
+        account_balance_usdt: float | None = None
+        if risk_cfg is not None and risk_cfg.enabled:
+            if (
+                risk_cfg.daily_loss_limit_usdt is not None
+                or risk_cfg.daily_loss_limit_pct is not None
+            ):
+                today_realized_pnl_usdt = await self._today_realized_pnl_usdt(
+                    session=session, config_id=config.id
+                )
+            # Only pay for the (exchange) balance fetch when the percent rule can
+            # actually fire — i.e. there is a realized loss today.
+            if risk_cfg.daily_loss_limit_pct is not None and today_realized_pnl_usdt < 0:
+                account_balance_usdt = await self._safe_subaccount_usdt_balance(
+                    session=session, user_id=config.user_id, account_id=config.account_id
+                )
+        return await check_pre_trade(
+            session=session,
+            config=config,
+            risk_cfg=risk_cfg,
+            signal=signal,
+            execution_symbol=execution_symbol,
+            today_realized_pnl_usdt=today_realized_pnl_usdt,
+            account_balance_usdt=account_balance_usdt,
+        )
+
+    async def precheck_manual_order(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        account_id: int,
+        symbol: str,
+        side: str,
+        price: float,
+    ) -> RiskDecision:
+        """Apply the account's pre-trade risk envelope to a MANUAL order (§3).
+
+        Manual live execution previously bypassed the supervisor. Here a manual
+        OPEN order on an account that has an auto-trade config is run through the
+        same :func:`check_pre_trade` engine, so the account's configured limits
+        govern manual and automated entries alike.
+
+        Fail-safe / non-breaking by construction:
+        - No auto-trade config for ``(user, account)`` ⇒ ``allow`` (manual trading
+          on un-configured accounts keeps today's behaviour).
+        - No / disabled risk row ⇒ ``allow`` (the engine's own no-op).
+        - Only opening orders are gated: a reducing order (spot ``sell`` / SHORT)
+          is de-risking and is never blocked.
+
+        A blocked decision records a ``risk_blocked`` audit event (``source:
+        manual_order``) so the manual block is auditable.
+        """
+        # Only opening orders are gated — a reducing/closing order must never block.
+        if side.strip().upper() != TREND_LONG:
+            return RiskDecision.allow()
+        config = await session.scalar(
+            select(AutoTradeConfig).where(
+                AutoTradeConfig.user_id == user_id,
+                AutoTradeConfig.account_id == account_id,
+            )
+        )
+        if config is None:
+            return RiskDecision.allow()
+        try:
+            execution_symbol = to_linear_perp_symbol(symbol)
+        except ValueError:
+            execution_symbol = symbol
+        signal = ParsedAutoTradeSignal(
+            schema_version="1.0.0",
+            symbol=symbol,
+            trend="LONG",  # gated path is opening-only (guarded above)
+            confidence_pct=100.0,
+            price_current=float(price) if price else 0.0,
+            generated_at=_utc_now(),
+        )
+        decision = await self.evaluate_pre_trade_risk(
+            session=session,
+            config=config,
+            signal=signal,
+            execution_symbol=execution_symbol,
+        )
+        if not decision.allowed:
+            await self._emit_event(
+                session=session,
+                user_id=user_id,
+                config_id=config.id,
+                profile_id=config.profile_id,
+                history_id=None,
+                position_id=None,
+                event_type="risk_blocked",
+                level=EVENT_LEVEL_WARNING,
+                message=decision.reason or "Manual order blocked by the pre-trade risk engine.",
+                payload={"rule": decision.rule, "source": "manual_order", **decision.payload},
+                commit=True,
+            )
+        return decision
 
     async def _today_realized_pnl_usdt(
         self, *, session: AsyncSession, config_id: int, now: datetime | None = None
@@ -1535,6 +1805,7 @@ class AutoTradeService:
         session: AsyncSession,
         config_id: int,
         risk: AutoTradeRiskConfigSchema | None,
+        commit: bool = True,
     ) -> None:
         """Create or wholesale-replace the 1:1 risk row from an upsert payload.
 
@@ -1543,9 +1814,22 @@ class AutoTradeService:
         the engine treats a missing row as "every limit off" (fail-safe).
         When present, the payload is the full desired state, so every column
         is overwritten (unset limits become ``NULL``).
+
+        ``commit=False`` lets the bulk apply-all path stage every config's row in
+        one transaction so a leverage rejection on any config aborts the batch.
         """
         if risk is None:
             return
+        # A1: authoritative leverage-ceiling check — covers every writer of the
+        # risk row (single upsert *and* the bulk apply-all path) by resolving the
+        # config's own venue, not the upsert payload's.
+        if risk.leverage_ceiling is not None:
+            config = await session.get(AutoTradeConfig, config_id)
+            if config is not None:
+                exchange_name = await self._resolve_account_exchange_name(
+                    session=session, account_id=config.account_id
+                )
+                _assert_leverage_ceiling_within_exchange(exchange_name, risk.leverage_ceiling)
         row = await session.get(AutoTradeRiskConfig, config_id)
         if row is None:
             row = AutoTradeRiskConfig(config_id=config_id)
@@ -1580,7 +1864,37 @@ class AutoTradeService:
         row.promote_max_dd_pct = risk.promote_max_dd_pct
         row.promote_min_trades = risk.promote_min_trades
         row.promote_min_sandbox_days = risk.promote_min_sandbox_days
+        if commit:
+            await session.commit()
+
+    async def apply_risk_config_to_all_strategies(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        risk: AutoTradeRiskConfigSchema,
+    ) -> int:
+        """A2 (audit §2): write one risk config to every strategy the user owns.
+
+        Reuses the per-config :meth:`_apply_risk_config` (so the same validation,
+        full-replace semantics and leverage-ceiling check apply) but stages all
+        rows in a single transaction: if any config's venue can't support the
+        requested ``leverage_ceiling`` the whole batch is rejected and nothing is
+        persisted. Returns the number of strategies updated.
+        """
+        configs = list(
+            (
+                await session.scalars(
+                    select(AutoTradeConfig).where(AutoTradeConfig.user_id == user_id)
+                )
+            ).all()
+        )
+        for config in configs:
+            await self._apply_risk_config(
+                session=session, config_id=config.id, risk=risk, commit=False
+            )
         await session.commit()
+        return len(configs)
 
     async def serialize_config(
         self,
@@ -1883,6 +2197,11 @@ class AutoTradeService:
         row.is_running = is_running
         if is_running:
             row.last_started_at = now
+            # A3: a manual resume clears the kill-switch risk-off latch — the
+            # operator has acknowledged the volatility trip and chosen to re-arm.
+            row.risk_off_latched = False
+            row.risk_off_reason = None
+            row.risk_off_at = None
         else:
             row.last_stopped_at = now
         await session.commit()
@@ -2684,6 +3003,12 @@ class AutoTradeService:
             payload={"source": "kill_switch", "reason": signal.reason, "closed": closed_ok},
             commit=False,
         )
+        # A3: persist the risk-off latch on the config so it survives a restart and
+        # is visible to operators/UI. Set unconditionally (even on a failed close or
+        # an already-paused strategy) — a confirmed spike means "no new entries".
+        config.risk_off_latched = True
+        config.risk_off_reason = signal.reason
+        config.risk_off_at = _utc_now()
         # Single atomic commit for the close + all events (the realtime caller
         # passes commit=False to join its own transaction).
         if commit:
@@ -4404,35 +4729,11 @@ class AutoTradeService:
         # Final gate before sizing/ordering, after the AI-overlay entry block.
         # A missing/disabled risk config is a no-op (fail-safe); a blocked
         # decision records a ``risk_blocked`` audit event and opens nothing.
-        risk_cfg = await self.get_risk_config(session=session, config_id=config.id)
-        # Daily-loss inputs are computed only when that rule is configured, so
-        # the common (no-daily-loss) path adds no exchange call or extra query.
-        today_realized_pnl_usdt = 0.0
-        account_balance_usdt: float | None = None
-        if risk_cfg is not None and risk_cfg.enabled:
-            if (
-                risk_cfg.daily_loss_limit_usdt is not None
-                or risk_cfg.daily_loss_limit_pct is not None
-            ):
-                today_realized_pnl_usdt = await self._today_realized_pnl_usdt(
-                    session=session, config_id=config.id
-                )
-            # Only pay for the (exchange) balance fetch when the percent rule can
-            # actually fire — i.e. there is a realized loss today. On a flat or
-            # profitable day the pct check is moot, so skip the call (and the
-            # spurious "balance unavailable" warning it could otherwise trigger).
-            if risk_cfg.daily_loss_limit_pct is not None and today_realized_pnl_usdt < 0:
-                account_balance_usdt = await self._safe_subaccount_usdt_balance(
-                    session=session, user_id=config.user_id, account_id=config.account_id
-                )
-        risk_decision = await check_pre_trade(
+        risk_decision = await self.evaluate_pre_trade_risk(
             session=session,
             config=config,
-            risk_cfg=risk_cfg,
             signal=signal,
             execution_symbol=execution_symbol,
-            today_realized_pnl_usdt=today_realized_pnl_usdt,
-            account_balance_usdt=account_balance_usdt,
         )
         if not risk_decision.allowed:
             state.last_trend = signal.trend

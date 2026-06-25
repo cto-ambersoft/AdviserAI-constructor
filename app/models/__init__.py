@@ -1,6 +1,7 @@
 from app.models.agent_freshness_status import AgentFreshnessStatus
 from app.models.audit import AuditLog
 from app.models.auto_trade_config import AutoTradeConfig
+from app.models.auto_trade_config_revision import AutoTradeConfigRevision
 from app.models.auto_trade_event import AutoTradeEvent
 from app.models.auto_trade_position import AutoTradePosition
 from app.models.auto_trade_risk_config import AutoTradeRiskConfig
@@ -39,6 +40,7 @@ __all__ = [
     "StrategyPromotionEvent",
     "AuditLog",
     "AutoTradeConfig",
+    "AutoTradeConfigRevision",
     "AutoTradePosition",
     "AutoTradeRiskConfig",
     "AutoTradeSignalState",
