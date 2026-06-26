@@ -8,6 +8,11 @@ from app.services.backtesting.common import (
     annotate_trade_confirmations,
     build_r_chart_points,
 )
+from app.services.backtesting.cost_model import (
+    apply_cost_model,
+    cost_model_from_params,
+    refresh_net_pnl_summary,
+)
 
 
 def grid_bot_backtest(
@@ -53,9 +58,10 @@ def grid_bot_backtest(
             take_price = float(pos["entry"] * (1 + spacing))
             if high >= take_price:
                 qty = float(pos["qty"])
-                gross = (take_price - float(pos["entry"])) * qty
-                fees = (float(pos["entry"]) * qty + take_price * qty) * fee
-                pnl = gross - fees
+                # Gross P&L; trading costs are netted uniformly by the cost model
+                # in run_grid_bot. The cash-flow fee below is kept so the running
+                # balance (and thus order capacity) is unchanged.
+                pnl = (take_price - float(pos["entry"])) * qty
                 trades.append(
                     {
                         "strategy": "Grid BOT",
@@ -86,9 +92,7 @@ def grid_bot_backtest(
         for _, pos in positions.items():
             qty = float(pos["qty"])
             entry = float(pos["entry"])
-            gross = (last_close - entry) * qty
-            fees = (entry * qty + last_close * qty) * fee
-            pnl = gross - fees
+            pnl = (last_close - entry) * qty  # gross; cost model nets fees
             trades.append(
                 {
                     "strategy": "Grid BOT",
@@ -114,12 +118,16 @@ def run_grid_bot(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
     initial_capital_usdt = float(
         params.get("initial_capital_usdt", params.get("allocation_usdt", 1000.0))
     )
+    # Resolve a single fee for both the running-balance accounting (order capacity)
+    # and the cost model, preferring the legacy ``order_fee_pct`` when supplied.
+    order_fee = params.get("order_fee_pct")
+    fee_pct = float(order_fee if order_fee is not None else params.get("fee_pct", 0.06))
     trades_df = grid_bot_backtest(
         df=df,
         ma_period=int(params.get("ma_period", 50)),
         grid_spacing_pct=float(params.get("grid_spacing_pct", 0.5)),
         grids_down=int(params.get("grids_down", 8)),
-        order_fee_pct=float(params.get("order_fee_pct", 0.06)),
+        order_fee_pct=fee_pct,
         initial_capital_usdt=initial_capital_usdt,
         order_size_usdt=(
             float(params["order_size_usdt"]) if params.get("order_size_usdt") is not None else None
@@ -138,6 +146,10 @@ def run_grid_bot(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any]:
     trades = annotate_trade_confirmations(
         [{str(key): value for key, value in row.items()} for row in raw_trades]
     )
+    # Finding 7.4: net trading costs off P&L before metrics (no-op when costs are 0),
+    # then refresh the gross-basis headline fields (win_rate, total_pnl_usdt) to net.
+    trades = apply_cost_model(trades, cost_model_from_params({**params, "fee_pct": fee_pct}))
+    refresh_net_pnl_summary(summary, trades)
     summary, equity_curve = add_capital_metrics(
         summary=summary,
         trades=trades,

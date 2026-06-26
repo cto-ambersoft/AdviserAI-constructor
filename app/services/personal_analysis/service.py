@@ -79,6 +79,7 @@ class PersonalAnalysisService:
             agents=payload.agents or {},
             agent_weights=payload.agent_weights or {},
             interval_minutes=payload.interval_minutes,
+            debate_enabled=payload.debate_enabled,
             is_active=True,
             next_run_at=now,
             last_triggered_at=None,
@@ -123,6 +124,8 @@ class PersonalAnalysisService:
             row.query_prompt = str(updates["query_prompt"]) if updates["query_prompt"] else None
         if "interval_minutes" in updates:
             row.interval_minutes = int(updates["interval_minutes"])
+        if "debate_enabled" in updates:
+            row.debate_enabled = bool(updates["debate_enabled"])
         if "is_active" in updates:
             row.is_active = bool(updates["is_active"])
             if row.is_active and row.next_run_at < _utc_now():
@@ -438,6 +441,17 @@ class PersonalAnalysisService:
         }
         if query_prompt:
             payload_json["query_prompt"] = query_prompt
+
+        # Debate integration (Вариант A): forward a debate override on its own
+        # channel when enabled — never alongside the agent selection. The manual
+        # trigger override wins over the profile flag; only `True` is sent (core
+        # defaults to debate off, so an absent key keeps the legacy behaviour).
+        debate_enabled = profile.debate_enabled
+        if overrides is not None and overrides.debate_enabled is not None:
+            debate_enabled = overrides.debate_enabled
+        if debate_enabled:
+            payload_json["debate"] = {"enabled": True}
+
         return payload_json
 
     async def _process_completed_job(

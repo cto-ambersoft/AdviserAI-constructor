@@ -22,10 +22,12 @@ from app.services.backtesting.common import (
     add_client_summary_fields,
     calculate_performance_metrics,
 )
+from app.services.backtesting.cost_model import cost_model_from_params
 from app.services.backtesting.grid_bot import run_grid_bot
 from app.services.backtesting.intraday_momentum import run_intraday_momentum
 from app.services.backtesting.knife_catcher import run_knife_catcher
 from app.services.backtesting.portfolio import run_portfolio
+from app.services.backtesting.run_manifest import build_run_manifest
 from app.services.backtesting.vwap_builder import run_vwap_backtest
 from app.services.indicators.engine import calc_indicators
 from app.services.market_data.service import MarketDataService
@@ -125,10 +127,31 @@ class BacktestingService:
             kwargs["end_time"] = payload.get("end_time")
         return await self.load_market_frame(**kwargs)
 
+    @staticmethod
+    def _attach_run_manifest(
+        result: dict[str, Any],
+        engine: str,
+        df: pd.DataFrame,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach the reproducibility manifest (Finding 7.1/7.2/7.3) to a result.
+
+        The cost model is rebuilt from the same payload the engine consumed, so
+        the manifest records exactly the costs that were applied. No-op-safe: it
+        only adds a ``run_manifest`` key and never mutates engine output.
+        """
+        result["run_manifest"] = build_run_manifest(
+            engine=engine,
+            candles=df,
+            cost=cost_model_from_params(payload),
+        )
+        return result
+
     async def run_vwap(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self._load_market_frame_from_payload(payload)
         indicators = calc_indicators(df)
-        return run_vwap_backtest(df, indicators, payload)
+        result = run_vwap_backtest(df, indicators, payload)
+        return self._attach_run_manifest(result, "vwap", df, payload)
 
     async def run_vwap_with_ai(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not payload.get("run_with_ai", False):
@@ -159,6 +182,8 @@ class BacktestingService:
 
         baseline = run_vwap_backtest(df, indicators, baseline_payload)
         ai_forecast = run_vwap_backtest(df, indicators, ai_payload)
+        self._attach_run_manifest(baseline, "vwap", df, baseline_payload)
+        self._attach_run_manifest(ai_forecast, "vwap", df, ai_payload)
         return {"baseline": baseline, "ai_forecast": ai_forecast}
 
     async def list_ai_forecast_backtest_files(self) -> list[dict[str, str]]:
@@ -345,37 +370,41 @@ class BacktestingService:
     async def run_atr_order_block(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self._load_market_frame_from_payload(payload)
         result = run_atr_order_block(df, payload)
-        return self._apply_ai_side_lock(
+        result = self._apply_ai_side_lock(
             result,
             df,
             payload,
             float(payload.get("allocation_usdt", 1000.0)),
         )
+        return self._attach_run_manifest(result, "atr_order_block", df, payload)
 
     async def run_knife(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self._load_market_frame_from_payload(payload)
         result = run_knife_catcher(df, payload)
-        return self._apply_ai_side_lock(
+        result = self._apply_ai_side_lock(
             result,
             df,
             payload,
             float(payload.get("account_balance", 1000.0)),
         )
+        return self._attach_run_manifest(result, "knife_catcher", df, payload)
 
     async def run_grid(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self._load_market_frame_from_payload(payload)
         adjusted_payload = self._apply_ai_grid_risk_multiplier(df, payload)
-        return run_grid_bot(df, adjusted_payload)
+        result = run_grid_bot(df, adjusted_payload)
+        return self._attach_run_manifest(result, "grid_bot", df, adjusted_payload)
 
     async def run_intraday(self, payload: dict[str, Any]) -> dict[str, Any]:
         df = await self._load_market_frame_from_payload(payload)
         result = run_intraday_momentum(df, payload)
-        return self._apply_ai_side_lock(
+        result = self._apply_ai_side_lock(
             result,
             df,
             payload,
             float(payload.get("allocation_usdt", 1000.0)),
         )
+        return self._attach_run_manifest(result, "intraday_momentum", df, payload)
 
     async def run_portfolio(self, payload: dict[str, Any]) -> dict[str, Any]:
         strategies = payload.get("strategies", [])

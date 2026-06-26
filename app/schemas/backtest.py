@@ -82,6 +82,12 @@ class BaseBacktestRequest(BaseModel):
     )
     include_series: bool = True
     trades_limit: int = Field(default=1000, ge=10, le=10_000)
+    # Finding 7.4: trading-cost model (per side, percent of notional). Default fee
+    # 0.06% matches the venue taker fee; slippage/funding default off. Set fee_pct=0
+    # to reproduce a cost-free backtest.
+    fee_pct: float = Field(default=0.06, ge=0, le=5)
+    slippage_pct: float = Field(default=0.0, ge=0, le=5)
+    funding_pct_per_bar: float = Field(default=0.0, ge=0, le=1)
 
 
 class VwapBacktestRequest(BaseBacktestRequest):
@@ -200,7 +206,7 @@ class IntradayMomentumRequest(BaseBacktestRequest):
     allocation_usdt: float = 1000.0
     risk_per_trade_pct: float = 1.0
     max_positions: int = 1
-    fee_pct: float = 0.06
+    # fee_pct / slippage_pct / funding_pct_per_bar are inherited from BaseBacktestRequest.
     entry_size_usdt: float | None = Field(default=None, gt=0)
     run_with_ai: bool = False
     ai_forecast_file: str | None = Field(default=None, min_length=1, max_length=255)
@@ -270,6 +276,9 @@ class BacktestResponse(BaseModel):
     trades: list[dict[str, Any]]
     chart_points: dict[str, Any]
     explanations: list[Any]
+    # Finding 7.1/7.2/7.3: reproducibility manifest (formula/engine versions,
+    # cost model, candles hash, data window). Optional for backward compatibility.
+    run_manifest: dict[str, Any] | None = None
 
 
 class VwapAiComparisonDelta(BaseModel):

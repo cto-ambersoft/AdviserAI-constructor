@@ -22,6 +22,7 @@ from app.services.backtesting.common import (
     build_r_chart_points,
     calculate_performance_metrics,
 )
+from app.services.backtesting.cost_model import apply_cost_model, cost_model_from_params
 from app.services.backtesting.stop_logic import compute_stop_loss
 
 VWAP_PRESETS = {
@@ -484,6 +485,8 @@ def run_vwap_backtest(
         ai_overlay=ai_overlay,
     )
     trades = annotate_trade_confirmations(trades)
+    # Finding 7.4: net trading costs off P&L before metrics (no-op when costs are 0).
+    trades = apply_cost_model(trades, cost_model_from_params(params))
     summary, equity_curve = add_capital_metrics(
         summary=calculate_performance_metrics(trades),
         trades=trades,

@@ -557,7 +557,7 @@
           "auth"
         ],
         "summary": "Enroll Email 2Fa",
-        "description": "Begin email-2FA enrollment: email a code the user must confirm (verify-on-\nenroll — the account email is not implicitly trusted). Requires Resend to be\nconfigured (503 otherwise). Throttled per user to prevent email-bombing.",
+        "description": "Begin email-2FA enrollment: email a code the user must confirm (verify-on-\nenroll \u2014 the account email is not implicitly trusted). Requires Resend to be\nconfigured (503 otherwise). Throttled per user to prevent email-bombing.",
         "operationId": "enroll_email_2fa_api_v1_auth_2fa_email_enroll_post",
         "responses": {
           "200": {
@@ -584,7 +584,7 @@
           "auth"
         ],
         "summary": "Confirm Email 2Fa",
-        "description": "Confirm enrollment with the emailed code → activates email-2FA. Wrong/expired\ncode → 400; per-factor lockout → 429.",
+        "description": "Confirm enrollment with the emailed code \u2192 activates email-2FA. Wrong/expired\ncode \u2192 400; per-factor lockout \u2192 429.",
         "operationId": "confirm_email_2fa_api_v1_auth_2fa_email_confirm_post",
         "requestBody": {
           "content": {
@@ -711,7 +711,7 @@
           "auth"
         ],
         "summary": "Request Email Confirmation",
-        "description": "T20 (W11c): email a one-time confirmation code for a critical action.\n\nDisabled (503) when Resend isn't configured — existing flows are unaffected.\nThrottled per user to prevent email-bombing.",
+        "description": "T20 (W11c): email a one-time confirmation code for a critical action.\n\nDisabled (503) when Resend isn't configured \u2014 existing flows are unaffected.\nThrottled per user to prevent email-bombing.",
         "operationId": "request_email_confirmation_api_v1_auth_email_confirm_request_post",
         "requestBody": {
           "content": {
@@ -1293,6 +1293,62 @@
             "HTTPBearer": []
           }
         ]
+      }
+    },
+    "/api/v1/backtest/metrics-schema": {
+      "get": {
+        "tags": [
+          "backtest"
+        ],
+        "summary": "Get metric formula definition + version (Finding 7.3 reproducibility)",
+        "operationId": "get_metric_formula_definition_api_v1_backtest_metrics_schema_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Metric Formula Definition Api V1 Backtest Metrics Schema Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/backtest/catalog": {
@@ -3477,7 +3533,7 @@
         "tags": [
           "live"
         ],
-        "summary": "Post-trade execution trace (signal → close timeline) for a position",
+        "summary": "Post-trade execution trace (signal \u2192 close timeline) for a position",
         "operationId": "get_position_trace_api_v1_live_auto_trade_positions__position_id__trace_get",
         "security": [
           {
@@ -3854,7 +3910,7 @@
           "live"
         ],
         "summary": "Start every enabled strategy for the user",
-        "description": "Bulk variant of ``/auto-trade/play``. Skips configs that are disabled or already running. One failure does not abort the others — every config gets its own per-row outcome.",
+        "description": "Bulk variant of ``/auto-trade/play``. Skips configs that are disabled or already running. One failure does not abort the others \u2014 every config gets its own per-row outcome.",
         "operationId": "play_all_auto_trade_api_v1_live_auto_trade_play_all_post",
         "security": [
           {
@@ -3909,7 +3965,7 @@
           "live"
         ],
         "summary": "Stop every running strategy for the user",
-        "description": "Bulk variant of ``/auto-trade/stop``. Only flips ``is_running=false`` — open positions are deliberately not closed. Use ``/auto-trade/close-positions`` (per account) when you want to flatten.",
+        "description": "Bulk variant of ``/auto-trade/stop``. Only flips ``is_running=false`` \u2014 open positions are deliberately not closed. Use ``/auto-trade/close-positions`` (per account) when you want to flatten.",
         "operationId": "stop_all_auto_trade_api_v1_live_auto_trade_stop_all_post",
         "responses": {
           "200": {
@@ -4131,7 +4187,7 @@
           "events"
         ],
         "summary": "Live risk/governance event stream (SSE)",
-        "description": "Push the authenticated user's streamable events (kill-switch, KPI-guard,\nportfolio-DD halt, data-stale, …) as Server-Sent Events.\n\nNote: browser ``EventSource`` cannot set an Authorization header, so the\nfrontend passes the bearer token via the proxy/cookie layer. The generator\nstops cleanly on client disconnect and on server shutdown (CancelledError).",
+        "description": "Push the authenticated user's streamable events (kill-switch, KPI-guard,\nportfolio-DD halt, data-stale, \u2026) as Server-Sent Events.\n\nNote: browser ``EventSource`` cannot set an Authorization header, so the\nfrontend passes the bearer token via the proxy/cookie layer. The generator\nstops cleanly on client disconnect and on server shutdown (CancelledError).",
         "operationId": "stream_events_api_v1_events_stream_get",
         "responses": {
           "200": {
@@ -6715,7 +6771,7 @@
           "checked_at"
         ],
         "title": "AgentFreshnessRead",
-        "description": "Current data-freshness snapshot for one (profile, agent) (W8 — T3.3)."
+        "description": "Current data-freshness snapshot for one (profile, agent) (W8 \u2014 T3.3)."
       },
       "AgentFreshnessResponse": {
         "properties": {
@@ -6960,7 +7016,7 @@
         },
         "type": "object",
         "title": "AiOverlayConfigUpdateRequest",
-        "description": "API request — partial update; missing fields keep their current value."
+        "description": "API request \u2014 partial update; missing fields keep their current value."
       },
       "AtrObSignalRequest": {
         "properties": {
@@ -7156,6 +7212,27 @@
             "minimum": 10.0,
             "title": "Trades Limit",
             "default": 1000
+          },
+          "fee_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Fee Pct",
+            "default": 0.06
+          },
+          "slippage_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Slippage Pct",
+            "default": 0.0
+          },
+          "funding_pct_per_bar": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Funding Pct Per Bar",
+            "default": 0.0
           },
           "ema_period": {
             "type": "integer",
@@ -7478,7 +7555,7 @@
         },
         "type": "object",
         "title": "AutoTradeCloseOpenPositionsRequest",
-        "description": "Request body for the manual ``/auto-trade/close-positions`` flatten flow.\n\nThe flow is intentionally two-step:\n\n  1. Client sends ``confirm: false`` (or omits it). The server returns\n     HTTP 412 with a preview of what would be closed — list of positions,\n     their sides/quantities, and how many conditional orders would be\n     cancelled. Nothing changes on the exchange or in the DB.\n  2. Client reviews the preview, then re-sends with ``confirm: true``.\n     The server proceeds to cancel TP/SL conditional orders and market-\n     close every open ``AutoTradePosition`` for the resolved scope.\n\nAuto-trade ``is_running`` is **not** flipped automatically. Stop and close\nare independent operations — the user explicitly asked for them to be\ndecoupled. Pending signals in the queue are also untouched."
+        "description": "Request body for the manual ``/auto-trade/close-positions`` flatten flow.\n\nThe flow is intentionally two-step:\n\n  1. Client sends ``confirm: false`` (or omits it). The server returns\n     HTTP 412 with a preview of what would be closed \u2014 list of positions,\n     their sides/quantities, and how many conditional orders would be\n     cancelled. Nothing changes on the exchange or in the DB.\n  2. Client reviews the preview, then re-sends with ``confirm: true``.\n     The server proceeds to cancel TP/SL conditional orders and market-\n     close every open ``AutoTradePosition`` for the resolved scope.\n\nAuto-trade ``is_running`` is **not** flipped automatically. Stop and close\nare independent operations \u2014 the user explicitly asked for them to be\ndecoupled. Pending signals in the queue are also untouched."
       },
       "AutoTradeCloseOpenPositionsResponse": {
         "properties": {
@@ -9193,6 +9270,18 @@
             "items": {},
             "type": "array",
             "title": "Explanations"
+          },
+          "run_manifest": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Manifest"
           }
         },
         "type": "object",
@@ -9944,6 +10033,27 @@
             "title": "Trades Limit",
             "default": 1000
           },
+          "fee_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Fee Pct",
+            "default": 0.06
+          },
+          "slippage_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Slippage Pct",
+            "default": 0.0
+          },
+          "funding_pct_per_bar": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Funding Pct Per Bar",
+            "default": 0.0
+          },
           "ma_period": {
             "type": "integer",
             "title": "Ma Period",
@@ -10261,6 +10371,27 @@
             "title": "Trades Limit",
             "default": 1000
           },
+          "fee_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Fee Pct",
+            "default": 0.06
+          },
+          "slippage_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Slippage Pct",
+            "default": 0.0
+          },
+          "funding_pct_per_bar": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Funding Pct Per Bar",
+            "default": 0.0
+          },
           "lookback": {
             "type": "integer",
             "title": "Lookback",
@@ -10315,11 +10446,6 @@
             "type": "integer",
             "title": "Max Positions",
             "default": 1
-          },
-          "fee_pct": {
-            "type": "number",
-            "title": "Fee Pct",
-            "default": 0.06
           },
           "entry_size_usdt": {
             "anyOf": [
@@ -10521,6 +10647,27 @@
             "minimum": 10.0,
             "title": "Trades Limit",
             "default": 1000
+          },
+          "fee_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Fee Pct",
+            "default": 0.06
+          },
+          "slippage_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Slippage Pct",
+            "default": 0.0
+          },
+          "funding_pct_per_bar": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Funding Pct Per Bar",
+            "default": 0.0
           },
           "side": {
             "type": "string",
@@ -11374,6 +11521,17 @@
               }
             ],
             "title": "Agent Weights"
+          },
+          "debate_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Debate Enabled"
           }
         },
         "type": "object",
@@ -11462,6 +11620,17 @@
             "minimum": 5.0,
             "title": "Interval Minutes",
             "default": 60
+          },
+          "debate_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Debate Enabled"
           }
         },
         "type": "object",
@@ -11517,6 +11686,17 @@
             "type": "boolean",
             "title": "Is Active"
           },
+          "debate_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Debate Enabled"
+          },
           "next_run_at": {
             "type": "string",
             "format": "date-time",
@@ -11567,6 +11747,7 @@
           "agent_weights",
           "interval_minutes",
           "is_active",
+          "debate_enabled",
           "next_run_at",
           "last_triggered_at",
           "last_completed_at",
@@ -11653,6 +11834,17 @@
               }
             ],
             "title": "Is Active"
+          },
+          "debate_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Debate Enabled"
           }
         },
         "type": "object",
@@ -12059,7 +12251,7 @@
           "closed_at"
         ],
         "title": "PositionTraceRead",
-        "description": "Post-Trade execution trace for one position (W9 — T3.1).\n\nThe signal→close timeline: position metadata + linkage pointers (the AI\n``decision_event_id`` points at core's ``ai_decision_events`` and is surfaced,\nnot dereferenced) + the chronological ``AutoTradeEvent`` list."
+        "description": "Post-Trade execution trace for one position (W9 \u2014 T3.1).\n\nThe signal\u2192close timeline: position metadata + linkage pointers (the AI\n``decision_event_id`` points at core's ``ai_decision_events`` and is surfaced,\nnot dereferenced) + the chronological ``AutoTradeEvent`` list."
       },
       "PromotionGateCriterionRead": {
         "properties": {
@@ -12125,7 +12317,7 @@
           "criteria"
         ],
         "title": "PromotionStatusRead",
-        "description": "Current lifecycle stage + KPI-Gate readiness for a strategy (B5 — W10)."
+        "description": "Current lifecycle stage + KPI-Gate readiness for a strategy (B5 \u2014 W10)."
       },
       "RefreshTokenRequest": {
         "properties": {
@@ -12350,7 +12542,7 @@
           "max_dd_pct": {
             "type": "number",
             "title": "Max Dd Pct",
-            "description": "Max drawdown as a % of the per-trade notional base (position_size_usdt), NOT account equity — a W9 proxy pending real-balance calibration. UI: label accordingly; do not present as account drawdown."
+            "description": "Max drawdown as a % of the per-trade notional base (position_size_usdt), NOT account equity \u2014 a W9 proxy pending real-balance calibration. UI: label accordingly; do not present as account drawdown."
           },
           "total_pnl_usdt": {
             "type": "number",
@@ -12359,7 +12551,7 @@
           "roi_pct": {
             "type": "number",
             "title": "Roi Pct",
-            "description": "Realized PnL as a % of the per-trade notional base (position_size_usdt), NOT account equity — a W9 proxy (can read high). Calibrate the base to the sub-account balance before relying on it; UI must label the denominator."
+            "description": "Realized PnL as a % of the per-trade notional base (position_size_usdt), NOT account equity \u2014 a W9 proxy (can read high). Calibrate the base to the sub-account balance before relying on it; UI must label the denominator."
           },
           "sharpe_proxy": {
             "type": "number",
@@ -12399,7 +12591,7 @@
           "computed_at"
         ],
         "title": "StrategyHealthRead",
-        "description": "On-read composite health for one strategy (W8 — T2.1)."
+        "description": "On-read composite health for one strategy (W8 \u2014 T2.1)."
       },
       "StrategyMetaResponse": {
         "properties": {
@@ -12634,7 +12826,7 @@
               }
             ],
             "title": "Roi Pct",
-            "description": "Realized PnL as a % of the per-trade notional base, NOT account equity (W9 proxy — can read high). UI must label the denominator; calibration pending."
+            "description": "Realized PnL as a % of the per-trade notional base, NOT account equity (W9 proxy \u2014 can read high). UI must label the denominator; calibration pending."
           },
           "health_class": {
             "anyOf": [
@@ -13590,6 +13782,27 @@
             "minimum": 10.0,
             "title": "Trades Limit",
             "default": 1000
+          },
+          "fee_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Fee Pct",
+            "default": 0.06
+          },
+          "slippage_pct": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Slippage Pct",
+            "default": 0.0
+          },
+          "funding_pct_per_bar": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Funding Pct Per Bar",
+            "default": 0.0
           },
           "regime": {
             "type": "string",

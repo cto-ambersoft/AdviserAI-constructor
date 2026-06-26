@@ -65,6 +65,7 @@ class PersonalAnalysisProfileCreate(BaseModel):
     agents: dict[str, bool] | None = None
     agent_weights: dict[str, float] | None = None
     interval_minutes: int = Field(default=60, ge=5, le=1440)
+    debate_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_agents(self) -> "PersonalAnalysisProfileCreate":
@@ -82,6 +83,7 @@ class PersonalAnalysisProfileUpdate(BaseModel):
     agent_weights: dict[str, float] | None = None
     interval_minutes: int | None = Field(default=None, ge=5, le=1440)
     is_active: bool | None = None
+    debate_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_update(self) -> "PersonalAnalysisProfileUpdate":
@@ -112,6 +114,7 @@ class PersonalAnalysisManualTriggerRequest(BaseModel):
     query_prompt: str | None = Field(default=None, max_length=10_000)
     agents: dict[str, bool] | None = None
     agent_weights: dict[str, float] | None = None
+    debate_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_overrides(self) -> "PersonalAnalysisManualTriggerRequest":
@@ -146,6 +149,7 @@ class PersonalAnalysisProfileRead(BaseModel):
     agent_weights: dict[str, float]
     interval_minutes: int
     is_active: bool
+    debate_enabled: bool | None
     next_run_at: datetime
     last_triggered_at: datetime | None
     last_completed_at: datetime | None

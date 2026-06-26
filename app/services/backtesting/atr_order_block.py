@@ -8,6 +8,11 @@ from app.services.backtesting.common import (
     annotate_trade_confirmations,
     build_r_chart_points,
 )
+from app.services.backtesting.cost_model import (
+    apply_cost_model,
+    cost_model_from_params,
+    refresh_net_pnl_summary,
+)
 
 
 def _calc_ema(series: pd.Series, period: int) -> pd.Series:
@@ -155,6 +160,10 @@ def run_atr_order_block(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, A
         }
         raw_trades = trades_df.to_dict(orient="records")
         trades = [{str(key): value for key, value in row.items()} for row in raw_trades]
+    # Finding 7.4: net trading costs off P&L before metrics (no-op when costs are 0),
+    # then refresh the gross-basis headline fields (win_rate, total_pnl_usdt) to net.
+    trades = apply_cost_model(trades, cost_model_from_params(params))
+    refresh_net_pnl_summary(summary, trades)
     trades = annotate_trade_confirmations(trades)
     summary, equity_curve = add_capital_metrics(
         summary=summary,

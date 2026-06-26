@@ -10,6 +10,7 @@ from app.models.base import Base
 from app.models.personal_analysis_history import PersonalAnalysisHistory
 from app.models.personal_analysis_job import PersonalAnalysisJob
 from app.models.personal_analysis_profile import PersonalAnalysisProfile
+from app.schemas.personal_analysis import PersonalAnalysisManualTriggerRequest
 from app.services.personal_analysis.provider import CoreAcceptedJob, CoreJobResult, CoreJobStatus
 from app.services.personal_analysis.service import PersonalAnalysisService
 
@@ -114,7 +115,11 @@ async def personal_service_db(tmp_path: Path) -> AsyncIterator[async_sessionmake
         await engine.dispose()
 
 
-async def _create_profile(session: AsyncSession, user_id: int = 1) -> PersonalAnalysisProfile:
+async def _create_profile(
+    session: AsyncSession,
+    user_id: int = 1,
+    debate_enabled: bool | None = None,
+) -> PersonalAnalysisProfile:
     profile = PersonalAnalysisProfile(
         user_id=user_id,
         symbol="BTCUSDT",
@@ -122,6 +127,7 @@ async def _create_profile(session: AsyncSession, user_id: int = 1) -> PersonalAn
         agents={"twitterSentiment": True},
         agent_weights={"twitterSentiment": 1.0},
         interval_minutes=60,
+        debate_enabled=debate_enabled,
         is_active=True,
         next_run_at=datetime.now(UTC),
         last_triggered_at=None,
@@ -168,6 +174,55 @@ async def test_poll_happy_path_persists_history_and_cleans_core(
         )
         assert len(history_rows) == 1
         assert history_rows[0].analysis_data["analysisReport"] == "ok"
+
+
+async def test_trigger_forwards_debate_override_when_profile_enabled(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session, debate_enabled=True)
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+        )
+
+    assert provider.request_calls[0]["debate"] == {"enabled": True}
+
+
+async def test_trigger_omits_debate_when_profile_disabled(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session)  # debate_enabled defaults to None
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+        )
+
+    assert "debate" not in provider.request_calls[0]
+
+
+async def test_manual_override_enables_debate_over_disabled_profile(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session, debate_enabled=False)
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+            overrides=PersonalAnalysisManualTriggerRequest(debate_enabled=True),
+        )
+
+    assert provider.request_calls[0]["debate"] == {"enabled": True}
 
 
 async def test_poll_failed_jobs_retries_and_then_marks_failed(

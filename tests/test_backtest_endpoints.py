@@ -90,6 +90,29 @@ def _write_ai_forecast_csv(path: Path) -> None:
     )
 
 
+async def test_metrics_schema_endpoint_returns_definition_and_flags_version() -> None:
+    from app.services.backtesting.run_manifest import metric_formula_version
+
+    current = metric_formula_version()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        plain = await client.get("/api/v1/backtest/metrics-schema")
+        matched = await client.get(
+            "/api/v1/backtest/metrics-schema", params={"version": current}
+        )
+        stale = await client.get(
+            "/api/v1/backtest/metrics-schema", params={"version": "stale000000"}
+        )
+
+    assert plain.status_code == 200
+    body = plain.json()
+    assert body["metric_formula_version"] == current
+    assert "metrics" in body["metrics_schema"]
+
+    assert matched.json()["matches_current"] is True
+    assert stale.json()["matches_current"] is False
+
+
 async def test_vwap_backtest_endpoint_returns_contract_shape() -> None:
     payload = {
         "symbol": "BTC/USDT",
@@ -106,7 +129,14 @@ async def test_vwap_backtest_endpoint_returns_contract_shape() -> None:
         response = await client.post("/api/v1/backtest/vwap", json=payload)
     assert response.status_code == 200
     body = response.json()
-    assert set(body.keys()) == {"summary", "trades", "chart_points", "explanations"}
+    assert set(body.keys()) == {
+        "summary",
+        "trades",
+        "chart_points",
+        "explanations",
+        "run_manifest",
+    }
+    assert body["run_manifest"]["engine"] == "vwap"
     assert "r_squared" in body["summary"]
     assert "r_cumulative" in body["summary"]
     assert "avg_r" in body["summary"]
@@ -195,8 +225,9 @@ async def test_vwap_backtest_with_ai_returns_baseline_and_ai_results(
         "max_drawdown_delta",
         "calmar_ratio_delta",
     }
-    assert set(body["result"].keys()) == {"summary", "trades", "chart_points", "explanations"}
-    assert set(body["baseline"].keys()) == {"summary", "trades", "chart_points", "explanations"}
+    expected_keys = {"summary", "trades", "chart_points", "explanations", "run_manifest"}
+    assert set(body["result"].keys()) == expected_keys
+    assert set(body["baseline"].keys()) == expected_keys
     assert "r_squared" in body["result"]["summary"]
     assert "r_cumulative" in body["result"]["summary"]
     assert "calmar_ratio" in body["result"]["summary"]
@@ -1052,3 +1083,29 @@ async def test_vwap_backtest_supports_extended_stop_and_sizing_contract() -> Non
         first_trade = body["trades"][0]
         assert first_trade["stop_mode"] == "Swing"
         assert isinstance(first_trade["sl_explain"], dict)
+
+
+async def test_vwap_backtest_applies_trading_costs() -> None:
+    """A2 (finding 7.4): VWAP nets trading costs off P&L; zero cost reproduces the
+    no-fee baseline; costs change only P&L, not which trades were taken."""
+    service = BacktestingService()
+    base_payload: dict[str, object] = {
+        "symbol": "BTC/USDT",
+        "timeframe": "1h",
+        "bars": 180,
+        "candles": _candles(180),
+        "enabled": ["EMA Fast (21)", "EMA Slow (50)", "VWAP", "MACD", "ATR"],
+        "regime": "Bull",
+        "account_balance": 1000.0,
+        "trades_limit": 200,
+    }
+    baseline = await service.run_vwap({**base_payload, "fee_pct": 0.0})
+    with_fee = await service.run_vwap({**base_payload, "fee_pct": 1.0})
+
+    # Costs must not change which trades the strategy took.
+    assert with_fee["summary"]["total_trades"] == baseline["summary"]["total_trades"]
+    closed = [t for t in with_fee["trades"] if t.get("exit_reason") != "OPEN"]
+    assert closed, "expected the trending candles to produce closed trades"
+    # Costs are netted: the account ends lower with fees, each closed trade has a cost.
+    assert with_fee["summary"]["final_balance"] < baseline["summary"]["final_balance"]
+    assert all(float(t.get("cost_usdt", 0.0)) > 0 for t in closed)

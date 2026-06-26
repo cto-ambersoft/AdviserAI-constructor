@@ -73,6 +73,7 @@ trade_platform/
 - `GET /api/v1/backtest/vwap/presets`
 - `GET /api/v1/backtest/vwap/regimes`
 - `GET /api/v1/backtest/catalog`
+- `GET /api/v1/backtest/metrics-schema` (metric formula definition + version; see [REPRODUCIBILITY.md](REPRODUCIBILITY.md))
 - `POST /api/v1/backtest/atr-order-block`
 - `POST /api/v1/backtest/knife-catcher`
 - `POST /api/v1/backtest/grid-bot`

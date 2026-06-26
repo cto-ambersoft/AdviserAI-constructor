@@ -7,6 +7,11 @@ from app.services.backtesting.common import (
     annotate_trade_confirmations,
     build_r_chart_points,
 )
+from app.services.backtesting.cost_model import (
+    apply_cost_model,
+    cost_model_from_params,
+    refresh_net_pnl_summary,
+)
 
 
 def _range_pct(open_price: float, high: float, low: float) -> float:
@@ -231,6 +236,10 @@ def run_knife_catcher(df: pd.DataFrame, params: dict[str, Any]) -> dict[str, Any
     trades = annotate_trade_confirmations(
         [{str(key): value for key, value in row.items()} for row in raw_trades]
     )
+    # Finding 7.4: net trading costs off P&L before metrics (no-op when costs are 0),
+    # then refresh the gross-basis headline fields (win_rate, total_pnl_usdt) to net.
+    trades = apply_cost_model(trades, cost_model_from_params(params))
+    refresh_net_pnl_summary(summary, trades)
     summary, equity_curve = add_capital_metrics(
         summary=summary,
         trades=trades,

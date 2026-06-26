@@ -10,6 +10,11 @@ from app.services.backtesting.common import (
     annotate_trade_confirmations,
     build_r_chart_points,
 )
+from app.services.backtesting.cost_model import (
+    apply_cost_model,
+    cost_model_from_params,
+    refresh_net_pnl_summary,
+)
 
 
 def intraday_momentum_backtest(
@@ -25,7 +30,6 @@ def intraday_momentum_backtest(
     allocation_usdt: float = 1000.0,
     risk_per_trade_pct: float = 1.0,
     max_positions: int = 1,
-    fee_pct: float = 0.06,
     entry_size_usdt: float | None = None,
 ) -> pd.DataFrame:
     work = df.copy()
@@ -43,7 +47,6 @@ def intraday_momentum_backtest(
     entry_i = -1
     entry = sl = tp = qty = 0.0
     trades: list[dict[str, Any]] = []
-    fee = fee_pct / 100.0
     start = max(lookback, atr_period, vol_sma) + 2
     for i in range(start, len(work) - 1):
         row = work.iloc[i]
@@ -104,9 +107,9 @@ def intraday_momentum_backtest(
             exit_price, exit_reason = float(row["close"]), "TIME"
         if exit_reason is None:
             continue
-        gross = (exit_price - entry) * qty if side.startswith("l") else (entry - exit_price) * qty
-        fees = (entry * qty + exit_price * qty) * fee
-        pnl = gross - fees
+        # Gross P&L; trading costs are netted uniformly by the cost model in
+        # run_intraday_momentum.
+        pnl = (exit_price - entry) * qty if side.startswith("l") else (entry - exit_price) * qty
         trades.append(
             {
                 "strategy": "Intraday Momentum",
@@ -142,7 +145,6 @@ def run_intraday_momentum(df: pd.DataFrame, params: dict[str, Any]) -> dict[str,
         allocation_usdt=allocation_usdt,
         risk_per_trade_pct=float(params.get("risk_per_trade_pct", 1.0)),
         max_positions=int(params.get("max_positions", 1)),
-        fee_pct=float(params.get("fee_pct", 0.06)),
         entry_size_usdt=(
             float(params["entry_size_usdt"]) if params.get("entry_size_usdt") is not None else None
         ),
@@ -161,6 +163,10 @@ def run_intraday_momentum(df: pd.DataFrame, params: dict[str, Any]) -> dict[str,
     trades = annotate_trade_confirmations(
         [{str(key): value for key, value in row.items()} for row in raw_trades]
     )
+    # Finding 7.4: net trading costs off P&L before metrics (no-op when costs are 0),
+    # then refresh the gross-basis headline fields (win_rate, total_pnl_usdt) to net.
+    trades = apply_cost_model(trades, cost_model_from_params(params))
+    refresh_net_pnl_summary(summary, trades)
     summary, equity_curve = add_capital_metrics(
         summary=summary,
         trades=trades,

@@ -42,6 +42,7 @@ from app.schemas.backtest import (
     VwapBacktestRequest,
     VwapCatalog,
 )
+from app.services.backtesting.run_manifest import build_metric_formula_definition
 from app.services.backtesting.service import BacktestingService
 from app.services.state.audit_service import AuditService
 from app.worker.tasks import run_portfolio_backtest
@@ -95,6 +96,14 @@ async def list_ai_forecast_backtest_files() -> AiForecastBacktestFilesResponse:
             for item in files
         ]
     )
+
+
+@router.get(
+    "/metrics-schema",
+    summary="Get metric formula definition + version (Finding 7.3 reproducibility)",
+)
+async def get_metric_formula_definition(version: str | None = None) -> dict[str, Any]:
+    return build_metric_formula_definition(version)
 
 
 @router.get(

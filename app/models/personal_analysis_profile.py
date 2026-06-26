@@ -16,6 +16,9 @@ class PersonalAnalysisProfile(Base, TimestampMixin):
     agents: Mapped[dict[str, bool]] = mapped_column(JSON(), nullable=False, default=dict)
     agent_weights: Mapped[dict[str, float]] = mapped_column(JSON(), nullable=False, default=dict)
     interval_minutes: Mapped[int] = mapped_column(Integer(), nullable=False, default=60)
+    # Debate integration: opt-in adversarial review of the forecast (off by
+    # default). NULL/False = disabled; only `True` forwards a debate override to core.
+    debate_enabled: Mapped[bool | None] = mapped_column(Boolean(), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True, index=True)
     next_run_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
