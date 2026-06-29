@@ -927,6 +927,18 @@
             }
           },
           {
+            "name": "include_shadow",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Also return counterfactual outcomes for forecasts never entered (OA).",
+              "default": false,
+              "title": "Include Shadow"
+            },
+            "description": "Also return counterfactual outcomes for forecasts never entered (OA)."
+          },
+          {
             "name": "X-Internal-API-Key",
             "in": "header",
             "required": false,
@@ -5328,6 +5340,53 @@
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analysis/personal/profiles/{profile_id}/oa-calibration": {
+      "get": {
+        "tags": [
+          "analysis-personal"
+        ],
+        "summary": "Outcome-Aware calibration + accuracy for a profile",
+        "operationId": "get_profile_oa_calibration_api_v1_analysis_personal_profiles__profile_id__oa_calibration_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Profile Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OaCalibrationResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -11285,6 +11344,223 @@
         ],
         "title": "MarketOhlcvResponse"
       },
+      "OaCalibrationResponse": {
+        "properties": {
+          "calibration": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OaProfileCalibration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "accuracy": {
+            "items": {
+              "$ref": "#/components/schemas/OaProfileAccuracy"
+            },
+            "type": "array",
+            "title": "Accuracy"
+          }
+        },
+        "type": "object",
+        "title": "OaCalibrationResponse",
+        "description": "Combined OA view served to the per-profile UI panel (S7)."
+      },
+      "OaProfileAccuracy": {
+        "properties": {
+          "windowDays": {
+            "type": "integer",
+            "title": "Windowdays"
+          },
+          "hitRate": {
+            "type": "number",
+            "title": "Hitrate",
+            "default": 0.0
+          },
+          "meanEdge": {
+            "type": "number",
+            "title": "Meanedge",
+            "default": 0.0
+          },
+          "sampleSize": {
+            "type": "integer",
+            "title": "Samplesize",
+            "default": 0
+          },
+          "realSampleSize": {
+            "type": "integer",
+            "title": "Realsamplesize",
+            "default": 0
+          },
+          "shadowSampleSize": {
+            "type": "integer",
+            "title": "Shadowsamplesize",
+            "default": 0
+          },
+          "horizonHours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Horizonhours"
+          }
+        },
+        "type": "object",
+        "required": [
+          "windowDays"
+        ],
+        "title": "OaProfileAccuracy",
+        "description": "A profile's forecast accuracy for one window (executed + shadow)."
+      },
+      "OaProfileCalibration": {
+        "properties": {
+          "method": {
+            "type": "string",
+            "title": "Method"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "params": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Params"
+          },
+          "sampleSize": {
+            "type": "integer",
+            "title": "Samplesize",
+            "default": 0
+          },
+          "trainSize": {
+            "type": "integer",
+            "title": "Trainsize",
+            "default": 0
+          },
+          "holdoutSize": {
+            "type": "integer",
+            "title": "Holdoutsize",
+            "default": 0
+          },
+          "horizonHours": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Horizonhours"
+          },
+          "holdoutBrier": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Holdoutbrier"
+          },
+          "holdoutBrierRaw": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Holdoutbrierraw"
+          },
+          "holdoutLogLoss": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Holdoutlogloss"
+          },
+          "holdoutLogLossRaw": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Holdoutloglossraw"
+          },
+          "ece": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ece"
+          },
+          "reliabilityBins": {
+            "items": {
+              "$ref": "#/components/schemas/OaReliabilityBin"
+            },
+            "type": "array",
+            "title": "Reliabilitybins"
+          }
+        },
+        "type": "object",
+        "required": [
+          "method",
+          "status"
+        ],
+        "title": "OaProfileCalibration",
+        "description": "A profile's probability calibrator + its out-of-sample quality (S7)."
+      },
+      "OaReliabilityBin": {
+        "properties": {
+          "pMid": {
+            "type": "number",
+            "title": "Pmid"
+          },
+          "predictedMean": {
+            "type": "number",
+            "title": "Predictedmean"
+          },
+          "observedRate": {
+            "type": "number",
+            "title": "Observedrate"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "pMid",
+          "predictedMean",
+          "observedRate",
+          "count"
+        ],
+        "title": "OaReliabilityBin",
+        "description": "One bin of the reliability (calibration) diagram."
+      },
       "PersonalAnalysisDefaultsRead": {
         "properties": {
           "available_agents": {
@@ -11532,6 +11808,17 @@
               }
             ],
             "title": "Debate Enabled"
+          },
+          "oa_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oa Enabled"
           }
         },
         "type": "object",
@@ -11631,6 +11918,17 @@
               }
             ],
             "title": "Debate Enabled"
+          },
+          "oa_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oa Enabled"
           }
         },
         "type": "object",
@@ -11697,6 +11995,17 @@
             ],
             "title": "Debate Enabled"
           },
+          "oa_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oa Enabled"
+          },
           "next_run_at": {
             "type": "string",
             "format": "date-time",
@@ -11748,6 +12057,7 @@
           "interval_minutes",
           "is_active",
           "debate_enabled",
+          "oa_enabled",
           "next_run_at",
           "last_triggered_at",
           "last_completed_at",
@@ -11845,6 +12155,17 @@
               }
             ],
             "title": "Debate Enabled"
+          },
+          "oa_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oa Enabled"
           }
         },
         "type": "object",

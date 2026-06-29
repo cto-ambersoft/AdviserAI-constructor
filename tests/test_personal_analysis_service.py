@@ -119,6 +119,7 @@ async def _create_profile(
     session: AsyncSession,
     user_id: int = 1,
     debate_enabled: bool | None = None,
+    oa_enabled: bool | None = None,
 ) -> PersonalAnalysisProfile:
     profile = PersonalAnalysisProfile(
         user_id=user_id,
@@ -128,6 +129,7 @@ async def _create_profile(
         agent_weights={"twitterSentiment": 1.0},
         interval_minutes=60,
         debate_enabled=debate_enabled,
+        oa_enabled=oa_enabled,
         is_active=True,
         next_run_at=datetime.now(UTC),
         last_triggered_at=None,
@@ -223,6 +225,72 @@ async def test_manual_override_enables_debate_over_disabled_profile(
         )
 
     assert provider.request_calls[0]["debate"] == {"enabled": True}
+
+
+async def test_trigger_forwards_oa_enabled_when_profile_enabled(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session, oa_enabled=True)
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+        )
+
+    assert provider.request_calls[0]["oa_enabled"] is True
+
+
+async def test_trigger_forwards_profile_identity_for_oa_calibration(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session, user_id=42)
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+        )
+
+    assert provider.request_calls[0]["user_id"] == 42
+    assert provider.request_calls[0]["profile_id"] == profile.id
+
+
+async def test_trigger_omits_oa_enabled_when_profile_disabled(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session)  # oa_enabled defaults to None
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+        )
+
+    assert "oa_enabled" not in provider.request_calls[0]
+
+
+async def test_manual_override_enables_oa_over_disabled_profile(
+    personal_service_db: async_sessionmaker[AsyncSession],
+) -> None:
+    provider = _HappyProvider()
+    service = PersonalAnalysisService(provider=provider)
+    async with personal_service_db() as session:
+        profile = await _create_profile(session, oa_enabled=False)
+        await service.trigger_profile(
+            session=session,
+            user_id=profile.user_id,
+            profile_id=profile.id,
+            overrides=PersonalAnalysisManualTriggerRequest(oa_enabled=True),
+        )
+
+    assert provider.request_calls[0]["oa_enabled"] is True
 
 
 async def test_poll_failed_jobs_retries_and_then_marks_failed(

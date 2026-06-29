@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import uuid4
@@ -16,6 +17,7 @@ from app.schemas.personal_analysis import (
     normalize_agents_and_weights,
 )
 from app.services.auto_trade.service import AutoTradeService
+from app.services.oa_shadow import OaShadowService
 from app.services.personal_analysis.http_provider import HttpPollingAnalysisProvider
 from app.services.personal_analysis.provider import (
     AnalysisProvider,
@@ -28,6 +30,8 @@ JOB_PROCESSING = "processing"
 JOB_COMPLETED = "completed"
 JOB_FAILED = "failed"
 _JOB_ACTIVE_STATUSES = (JOB_PENDING, JOB_PROCESSING)
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -45,6 +49,7 @@ class PersonalAnalysisService:
     def __init__(self, provider: AnalysisProvider | None = None) -> None:
         self._provider = provider or HttpPollingAnalysisProvider()
         self._auto_trade = AutoTradeService()
+        self._oa_shadow = OaShadowService()
         settings = get_settings()
         self._status_batch_size = settings.personal_analysis_status_batch_size
         self._max_attempts = settings.personal_analysis_max_attempts
@@ -64,6 +69,20 @@ class PersonalAnalysisService:
         )
         return list(rows.all())
 
+    async def get_profile(
+        self,
+        *,
+        session: AsyncSession,
+        user_id: int,
+        profile_id: int,
+    ) -> PersonalAnalysisProfile | None:
+        return await session.scalar(
+            select(PersonalAnalysisProfile).where(
+                PersonalAnalysisProfile.id == profile_id,
+                PersonalAnalysisProfile.user_id == user_id,
+            )
+        )
+
     async def create_profile(
         self,
         *,
@@ -80,6 +99,7 @@ class PersonalAnalysisService:
             agent_weights=payload.agent_weights or {},
             interval_minutes=payload.interval_minutes,
             debate_enabled=payload.debate_enabled,
+            oa_enabled=payload.oa_enabled,
             is_active=True,
             next_run_at=now,
             last_triggered_at=None,
@@ -126,6 +146,8 @@ class PersonalAnalysisService:
             row.interval_minutes = int(updates["interval_minutes"])
         if "debate_enabled" in updates:
             row.debate_enabled = bool(updates["debate_enabled"])
+        if "oa_enabled" in updates:
+            row.oa_enabled = bool(updates["oa_enabled"])
         if "is_active" in updates:
             row.is_active = bool(updates["is_active"])
             if row.is_active and row.next_run_at < _utc_now():
@@ -438,6 +460,10 @@ class PersonalAnalysisService:
             "symbol": profile.symbol,
             "agents": agents,
             "agent_weights": weights,
+            # Profile identity so core can resolve this profile's Outcome-Aware
+            # calibration at decision time (S5). Not opt-in — always sent.
+            "user_id": profile.user_id,
+            "profile_id": profile.id,
         }
         if query_prompt:
             payload_json["query_prompt"] = query_prompt
@@ -451,6 +477,15 @@ class PersonalAnalysisService:
             debate_enabled = overrides.debate_enabled
         if debate_enabled:
             payload_json["debate"] = {"enabled": True}
+
+        # Outcome-Aware opt-in on its own top-level channel (mirrors debate). Manual
+        # trigger override wins over the profile flag; only `True` is sent (core
+        # defaults OA off, so an absent key keeps it off).
+        oa_enabled = profile.oa_enabled
+        if overrides is not None and overrides.oa_enabled is not None:
+            oa_enabled = overrides.oa_enabled
+        if oa_enabled:
+            payload_json["oa_enabled"] = True
 
         return payload_json
 
@@ -502,6 +537,19 @@ class PersonalAnalysisService:
                 session=session,
                 history=created_history,
             )
+            # OA shadow outcome (S2): record the forecast as a counterfactual
+            # candidate so its realized move can be backfilled later. Best-effort —
+            # a shadow failure must never break forecast persistence.
+            try:
+                await self._oa_shadow.record_candidate(
+                    session=session,
+                    history=created_history,
+                )
+            except Exception:  # noqa: BLE001 - shadow logging is non-critical
+                logger.exception(
+                    "oa_shadow record_candidate failed for history_id=%s",
+                    created_history.id,
+                )
 
         profile = await session.get(PersonalAnalysisProfile, job.profile_id)
         if profile is not None:

@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from app.api.deps import CurrentUser, DbSession
 from app.schemas.personal_analysis import (
     PERSONAL_ANALYSIS_AGENT_NAMES,
+    OaCalibrationResponse,
     PersonalAnalysisDefaultsRead,
     PersonalAnalysisHistoryRead,
     PersonalAnalysisJobRead,
@@ -15,11 +16,13 @@ from app.schemas.personal_analysis import (
     PersonalAnalysisProfileUpdate,
     get_personal_analysis_defaults,
 )
+from app.services.oa_proxy import OaProxyClient
 from app.services.personal_analysis.provider import AnalysisProviderError
 from app.services.personal_analysis.service import PersonalAnalysisService
 
 router = APIRouter()
 personal_analysis_service = PersonalAnalysisService()
+oa_proxy_client = OaProxyClient()
 
 
 @router.get(
@@ -121,6 +124,34 @@ async def deactivate_personal_analysis_profile(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Personal analysis profile not found.",
         )
+
+
+@router.get(
+    "/profiles/{profile_id}/oa-calibration",
+    response_model=OaCalibrationResponse,
+    summary="Outcome-Aware calibration + accuracy for a profile",
+)
+async def get_profile_oa_calibration(
+    profile_id: int,
+    session: DbSession,
+    current_user: CurrentUser,
+) -> OaCalibrationResponse:
+    profile = await personal_analysis_service.get_profile(
+        session=session,
+        user_id=current_user.id,
+        profile_id=profile_id,
+    )
+    if profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Personal analysis profile not found.",
+        )
+    data = await oa_proxy_client.fetch_calibration(
+        user_id=current_user.id,
+        profile_id=profile_id,
+        symbol=profile.symbol,
+    )
+    return OaCalibrationResponse.model_validate(data)
 
 
 @router.post(

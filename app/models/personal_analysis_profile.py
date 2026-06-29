@@ -19,6 +19,9 @@ class PersonalAnalysisProfile(Base, TimestampMixin):
     # Debate integration: opt-in adversarial review of the forecast (off by
     # default). NULL/False = disabled; only `True` forwards a debate override to core.
     debate_enabled: Mapped[bool | None] = mapped_column(Boolean(), nullable=True, default=None)
+    # Outcome-Aware agent: opt-in self-learning overlay (off by default). NULL/False
+    # = disabled; only `True` forwards an oa_enabled opt-in to core.
+    oa_enabled: Mapped[bool | None] = mapped_column(Boolean(), nullable=True, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True, index=True)
     next_run_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

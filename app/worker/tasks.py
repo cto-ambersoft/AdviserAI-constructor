@@ -7,6 +7,7 @@ from app.services.auto_trade.service import AutoTradeService
 from app.services.auto_trade.trade_sync import ExchangeTradeSyncService
 from app.services.backtesting.service import BacktestingService
 from app.services.notifications.service import TelegramNotificationService
+from app.services.oa_shadow import OaShadowService
 from app.services.personal_analysis.freshness import sweep_agent_freshness
 from app.services.personal_analysis.service import PersonalAnalysisService
 from app.services.watchers.service import run_position_watcher_tick
@@ -20,6 +21,7 @@ auto_trade_service = AutoTradeService()
 trade_sync_service = ExchangeTradeSyncService()
 income_sync_service = ExchangeIncomeSyncService()
 telegram_notify_service = TelegramNotificationService()
+oa_shadow_service = OaShadowService()
 logger = logging.getLogger(__name__)
 
 
@@ -121,6 +123,25 @@ async def sync_auto_trade_exchange_trades() -> dict[str, int]:
             stats.get("configs", 0),
             stats.get("synced", 0),
             stats.get("inserted_or_updated", 0),
+            stats.get("errors", 0),
+        )
+    return stats
+
+
+@broker.task(
+    task_name="app.worker.tasks.backfill_oa_shadow_outcomes",
+    schedule=[{"cron": "*/15 * * * *", "schedule_id": "oa_shadow_backfill_every_15m"}],
+)
+async def backfill_oa_shadow_outcomes() -> dict[str, int]:
+    async with AsyncSessionFactory() as session:
+        stats = await oa_shadow_service.backfill_due(session=session)
+        await session.commit()
+    if _stats_has_non_zero(stats, keys=("filled", "errors")):
+        logger.info(
+            "oa_shadow_backfill summary: due=%s filled=%s skipped=%s errors=%s",
+            stats.get("due", 0),
+            stats.get("filled", 0),
+            stats.get("skipped", 0),
             stats.get("errors", 0),
         )
     return stats

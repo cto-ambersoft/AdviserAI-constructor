@@ -15,6 +15,7 @@ from app.models.exchange_trade_sync_state import ExchangeTradeSyncState
 from app.models.live_paper_event import LivePaperEvent
 from app.models.live_paper_profile import LivePaperProfile
 from app.models.live_paper_trade import LivePaperTrade
+from app.models.oa_shadow_outcome import OaShadowOutcome
 from app.models.personal_analysis_history import PersonalAnalysisHistory
 from app.models.personal_analysis_job import PersonalAnalysisJob
 from app.models.personal_analysis_profile import PersonalAnalysisProfile
@@ -58,6 +59,7 @@ __all__ = [
     "PersonalAnalysisProfile",
     "PersonalAnalysisJob",
     "PersonalAnalysisHistory",
+    "OaShadowOutcome",
     "TelegramNotificationSettings",
     "TelegramNotificationDelivery",
     "UserTotp",

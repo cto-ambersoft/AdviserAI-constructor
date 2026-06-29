@@ -253,3 +253,72 @@ async def test_personal_analysis_history_and_latest(
         assert latest_resp.json()["trade_job_id"] == "job-1"
         latest_flat = latest_resp.json()["analysis_data"]["trendExtraction"]["flat"]
         assert latest_flat["probabilityPct"] == 65
+
+
+async def test_oa_calibration_endpoint_returns_core_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = {
+        "calibration": {
+            "method": "temperature",
+            "status": "active",
+            "params": {"T": 1.2},
+            "sampleSize": 40,
+            "trainSize": 28,
+            "holdoutSize": 12,
+            "holdoutBrier": 0.2,
+            "holdoutBrierRaw": 0.3,
+            "ece": 0.05,
+            "reliabilityBins": [
+                {"pMid": 0.55, "predictedMean": 0.54, "observedRate": 0.5, "count": 10}
+            ],
+            "userId": 1,  # extra core field, must be ignored
+        },
+        "accuracy": [
+            {
+                "windowDays": 30,
+                "hitRate": 0.6,
+                "meanEdge": 1.2,
+                "sampleSize": 40,
+                "realSampleSize": 10,
+                "shadowSampleSize": 30,
+            }
+        ],
+    }
+
+    async def _fake_fetch(*, user_id: int, profile_id: int, symbol: str) -> dict[str, object]:
+        assert user_id == 1
+        assert symbol == "BTCUSDT"
+        return fake
+
+    monkeypatch.setattr(
+        personal_analysis_endpoint.oa_proxy_client, "fetch_calibration", _fake_fetch
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/analysis/personal/profiles",
+            json={"symbol": "BTCUSDT"},
+        )
+        profile_id = created.json()["id"]
+        resp = await client.get(
+            f"/api/v1/analysis/personal/profiles/{profile_id}/oa-calibration"
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["calibration"]["method"] == "temperature"
+    assert body["calibration"]["reliabilityBins"][0]["count"] == 10
+    assert "userId" not in body["calibration"]  # extra field stripped
+    assert body["accuracy"][0]["hitRate"] == 0.6
+    assert body["accuracy"][0]["shadowSampleSize"] == 30
+
+
+async def test_oa_calibration_endpoint_404_for_unknown_profile() -> None:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/api/v1/analysis/personal/profiles/999/oa-calibration"
+        )
+    assert resp.status_code == 404

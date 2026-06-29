@@ -66,6 +66,7 @@ class PersonalAnalysisProfileCreate(BaseModel):
     agent_weights: dict[str, float] | None = None
     interval_minutes: int = Field(default=60, ge=5, le=1440)
     debate_enabled: bool | None = None
+    oa_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_agents(self) -> "PersonalAnalysisProfileCreate":
@@ -84,6 +85,7 @@ class PersonalAnalysisProfileUpdate(BaseModel):
     interval_minutes: int | None = Field(default=None, ge=5, le=1440)
     is_active: bool | None = None
     debate_enabled: bool | None = None
+    oa_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_update(self) -> "PersonalAnalysisProfileUpdate":
@@ -115,6 +117,7 @@ class PersonalAnalysisManualTriggerRequest(BaseModel):
     agents: dict[str, bool] | None = None
     agent_weights: dict[str, float] | None = None
     debate_enabled: bool | None = None
+    oa_enabled: bool | None = None
 
     @model_validator(mode="after")
     def validate_overrides(self) -> "PersonalAnalysisManualTriggerRequest":
@@ -150,6 +153,7 @@ class PersonalAnalysisProfileRead(BaseModel):
     interval_minutes: int
     is_active: bool
     debate_enabled: bool | None
+    oa_enabled: bool | None
     next_run_at: datetime
     last_triggered_at: datetime | None
     last_completed_at: datetime | None
@@ -223,3 +227,53 @@ class AgentFreshnessRead(BaseModel):
 
 class AgentFreshnessResponse(BaseModel):
     statuses: list[AgentFreshnessRead] = Field(default_factory=list)
+
+
+class OaReliabilityBin(BaseModel):
+    """One bin of the reliability (calibration) diagram."""
+
+    pMid: float
+    predictedMean: float
+    observedRate: float
+    count: int
+
+
+class OaProfileCalibration(BaseModel):
+    """A profile's probability calibrator + its out-of-sample quality (S7)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    method: str
+    status: str
+    params: dict[str, float] = Field(default_factory=dict)
+    sampleSize: int = 0
+    trainSize: int = 0
+    holdoutSize: int = 0
+    horizonHours: int | None = None
+    holdoutBrier: float | None = None
+    holdoutBrierRaw: float | None = None
+    holdoutLogLoss: float | None = None
+    holdoutLogLossRaw: float | None = None
+    ece: float | None = None
+    reliabilityBins: list[OaReliabilityBin] = Field(default_factory=list)
+
+
+class OaProfileAccuracy(BaseModel):
+    """A profile's forecast accuracy for one window (executed + shadow)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    windowDays: int
+    hitRate: float = 0.0
+    meanEdge: float = 0.0
+    sampleSize: int = 0
+    realSampleSize: int = 0
+    shadowSampleSize: int = 0
+    horizonHours: int | None = None
+
+
+class OaCalibrationResponse(BaseModel):
+    """Combined OA view served to the per-profile UI panel (S7)."""
+
+    calibration: OaProfileCalibration | None = None
+    accuracy: list[OaProfileAccuracy] = Field(default_factory=list)
